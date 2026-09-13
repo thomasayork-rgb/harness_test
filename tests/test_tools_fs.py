@@ -184,3 +184,93 @@ def test_fs_read_errors_name_the_relative_path_only(tmp_path):
     assert json.loads(artifact(res, steps[3]))["content"].startswith("hello from the notes")
     # nothing in the trajectory tells the model where the workdir lives on disk
     assert str(work) not in (res.run_dir / "trajectory.jsonl").read_text(encoding="utf-8")
+
+
+def test_write_and_list_through_the_runtime(tmp_path):
+    work = project(tmp_path / "work")
+    script = [
+        {"content": "Activating the two tools.",
+         "tool_calls": [call("toolbelt_add", {"names": ["fs_write", "fs_list"]})]},
+        {"content": "Listing the root.", "tool_calls": [call("fs_list", {})]},
+        {"content": "Listing one file.", "tool_calls": [call("fs_list", {"path": "notes.md"})]},
+        {"content": "Listing a directory that is not there.", "tool_calls": [call("fs_list", {"path": "nope"})]},
+        {"content": "Listing outside the workdir.", "tool_calls": [call("fs_list", {"path": "../"})]},
+        {"content": "Capping the listing.", "tool_calls": [call("fs_list", {"max_entries": 2})]},
+        {"content": "Writing a file, creating its parents.",
+         "tool_calls": [call("fs_write", {"path": "out/deep/report.txt", "content": "first\n"})]},
+        {"content": "Overwriting it.",
+         "tool_calls": [call("fs_write", {"path": "out/deep/report.txt", "content": "second\n"})]},
+        {"content": "Writing outside the workdir.",
+         "tool_calls": [call("fs_write", {"path": "../escape.txt", "content": "nope"})]},
+        {"content": "Writing over a directory.",
+         "tool_calls": [call("fs_write", {"path": "src", "content": "nope"})]},
+        {"content": "Forgetting an argument.", "tool_calls": [call("fs_write", {"path": "x.txt"})]},
+        {"content": "Seeing the new file.", "tool_calls": [call("fs_list", {"path": "out/deep"})]},
+        {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
+    ]
+    res, steps = drive(tmp_path, work, script)
+    assert res.status == "completed"
+    assert [s["kind"] for s in steps] == [
+        "ok", "ok", "ok", "error", "error", "ok", "ok", "ok", "error", "error", "error",
+        "ok", "ok", "final_accepted"]
+
+    root = json.loads(artifact(res, steps[1]))
+    assert [e["name"] for e in root["entries"]] == [
+        "__pycache__", "blob.bin", "latin.txt", "notes.md", "src"]
+    assert [e["type"] for e in root["entries"]][0] == "dir"
+    assert json.loads(artifact(res, steps[2])) == {"path": "notes.md", "type": "file", "bytes": 33}
+    assert "FileNotFoundError: nope" in steps[3]["result_preview"]
+    assert "escapes workdir: ../" in steps[4]["result_preview"]
+    capped = json.loads(artifact(res, steps[5]))
+    assert [e["name"] for e in capped["entries"]] == ["__pycache__", "blob.bin", "..."]
+
+    assert json.loads(steps[6]["result_preview"]) == {"path": "out/deep/report.txt", "bytes": 6}
+    assert (work / "out" / "deep" / "report.txt").read_text() == "second\n"
+    assert "escapes workdir: ../escape.txt" in steps[8]["result_preview"]
+    assert not (tmp_path / "escape.txt").exists() and not (work.parent / "escape.txt").exists()
+    assert "IsADirectoryError" in steps[9]["result_preview"]
+    assert "missing required argument(s): content" in steps[10]["result_preview"]
+    assert [e["name"] for e in json.loads(artifact(res, steps[11]))["entries"]] == ["report.txt"]
+
+
+def test_run_shell_through_the_runtime(tmp_path):
+    work = project(tmp_path / "work")
+    (work.parent / "outside.txt").write_text("secret\n", encoding="utf-8")
+    script = [
+        {"content": "Activating the shell.", "tool_calls": [call("toolbelt_add", {"names": ["run_shell"]})]},
+        {"content": "Where am I?", "tool_calls": [call("run_shell", {"command": "pwd && ls"})]},
+        {"content": "A command that fails.", "tool_calls": [call("run_shell", {"command": "ls no_such_file"})]},
+        {"content": "Something that hangs.",
+         "tool_calls": [call("run_shell", {"command": "sleep 5", "timeout": 1})]},
+        {"content": "Wrong argument type.", "tool_calls": [call("run_shell", {"command": "true", "timeout": "1"})]},
+        {"content": "Missing the command.", "tool_calls": [call("run_shell", {})]},
+        {"content": "Reaching outside the workdir.",
+         "tool_calls": [call("run_shell", {"command": "cat ../outside.txt"})]},
+        {"content": "Writing through the shell.",
+         "tool_calls": [call("run_shell", {"command": "echo shelled > from_shell.txt"})]},
+        {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
+    ]
+    res, steps = drive(tmp_path, work, script)
+    assert res.status == "completed"
+    assert [s["kind"] for s in steps] == [
+        "ok", "ok", "ok", "error", "error", "error", "ok", "ok", "ok", "final_accepted"]
+
+    where = json.loads(artifact(res, steps[1]))
+    assert where["exit_code"] == 0
+    assert where["stdout"].splitlines()[0] == str(work)      # the command starts in the workdir
+    assert "notes.md" in where["stdout"]
+
+    failed = json.loads(artifact(res, steps[2]))
+    assert failed["exit_code"] != 0 and failed["stderr"]     # a non-zero exit is a result, not an error
+
+    # a timeout is a tool failure: kind "error", not an "ok" result with an error field in it
+    assert steps[3]["result_preview"] == "error: TimeoutError: command timed out after 1s: sleep 5"
+    assert "argument 'timeout' must be integer" in steps[4]["result_preview"]
+    assert "missing required argument(s): command" in steps[5]["result_preview"]
+
+    # run_shell starts in the workdir but is not a sandbox: the shell can still
+    # walk out of it. Rooting is an fs_* guarantee; for the shell the lever is
+    # the tool-call policy (--deny-tool / --deny-shell-pattern).
+    escaped = json.loads(artifact(res, steps[6]))
+    assert escaped["exit_code"] == 0 and "secret" in escaped["stdout"]
+    assert (work / "from_shell.txt").read_text() == "shelled\n"
