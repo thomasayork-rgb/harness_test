@@ -157,3 +157,22 @@ def test_edit_refuses_binary_and_empty_old(tmp_path):
     assert "not a file: src" in steps[5]["result_preview"]
     assert (work / "blob.bin").read_bytes() == b"hello\x00\x00binary"
     assert (work / "latin.txt").read_bytes() == b"caf\xe9 au lait\n"
+
+
+def test_fs_read_errors_name_the_relative_path_only(tmp_path):
+    work = project(tmp_path / "work")
+    script = [
+        {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["fs_read"]})]},
+        {"content": "Reading a file that is not there.",
+         "tool_calls": [call("fs_read", {"path": "src/missing.py"})]},
+        {"content": "Reading a directory.", "tool_calls": [call("fs_read", {"path": "src"})]},
+        {"content": "Reading a real file.", "tool_calls": [call("fs_read", {"path": "notes.md"})]},
+        {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
+    ]
+    res, steps = drive(tmp_path, work, script)
+    assert [s["kind"] for s in steps[1:4]] == ["error", "error", "ok"]
+    assert steps[1]["result_preview"] == "error: FileNotFoundError: no such file: src/missing.py"
+    assert steps[2]["result_preview"] == "error: IsADirectoryError: not a file: src"
+    assert json.loads(artifact(res, steps[3]))["content"].startswith("hello from the notes")
+    # nothing in the trajectory tells the model where the workdir lives on disk
+    assert str(work) not in (res.run_dir / "trajectory.jsonl").read_text(encoding="utf-8")

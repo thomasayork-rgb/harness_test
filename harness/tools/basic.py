@@ -43,6 +43,12 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
     )
     def fs_read(path: str, offset: int = 0, limit: int = 20000) -> dict:
         p = resolve(path)
+        # Report the path the model asked for; the absolute one is not its business
+        # and would follow the run into the trajectory.
+        if not p.exists():
+            raise FileNotFoundError(f"no such file: {path}")
+        if not p.is_file():
+            raise IsADirectoryError(f"not a file: {path}")
         text = p.read_text(encoding="utf-8", errors="replace")
         return {"path": path, "total_chars": len(text), "offset": offset, "content": text[offset: offset + limit]}
 
