@@ -2,7 +2,7 @@
 name: investigate
 description: Answer a question about a codebase with evidence, not recollection.
   Glob, search, read, then quote paths and line numbers.
-tools: [fs_glob, fs_search, fs_read]
+tools: [fs_glob, fs_search, fs_read, scratch_write]
 ---
 # Investigate a codebase
 
