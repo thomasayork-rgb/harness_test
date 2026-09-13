@@ -12,6 +12,7 @@ import pytest
 
 from harness.cli import main
 from harness.mockserver import MockOpenAIServer
+from harness.runtime import META_NAMES
 from harness.prompts import (GLOBAL_ENV, SYSTEM_PROMPT, PromptError, global_prompt_path,
                              resolve_system_prompt)
 from harness.trajectory import format_summary, format_trace, read_trajectory, summarize
@@ -46,10 +47,26 @@ def plan_and_finish(status="in_progress"):
 FINISH = call("final_answer", {"status": "completed", "content": "ok"})
 
 
-def test_the_builtin_prompt_stays_within_its_budget():
-    """Local models pay for every token of this on every single request."""
+def test_the_builtin_prompt_stays_within_its_budget_and_teaches_the_mechanics():
+    """Local models pay for every token of this on every single request, so it
+    has a hard ceiling - and it still has to name every lever the loop has."""
     assert len(SYSTEM_PROMPT) < 3500, f"built-in prompt is {len(SYSTEM_PROMPT)} chars"
-    assert SYSTEM_PROMPT.strip() == SYSTEM_PROMPT.strip().rstrip()
+    for name in META_NAMES:
+        assert name in SYSTEM_PROMPT, f"{name} is not explained to the model"
+    for topic in ("scratch_write", "denied", "in_progress", "fs_edit", "run_shell", "evicted"):
+        assert topic in SYSTEM_PROMPT, f"{topic} is not explained to the model"
+
+
+def test_the_example_global_prompt_loads_as_house_rules(isolated_home):
+    """examples/global-system.md is shipped to be dropped in as a global prompt."""
+    example = (REPO_ROOT / "examples" / "global-system.md").read_text(encoding="utf-8")
+    write(isolated_home / ".config" / "harness" / "system.md", example)
+
+    text, sources = resolve_system_prompt()
+    assert text == f"{BUILTIN}\n\n{example.strip()}"
+    assert "Never run a destructive shell command" in text
+    assert [s["role"] for s in sources] == ["base", "global"]
+    assert sources[1]["chars"] == len(example.strip())
 
 
 def test_prompt_precedence_is_flag_then_env_then_xdg_then_home(tmp_path, monkeypatch, isolated_home):
