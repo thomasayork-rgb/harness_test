@@ -16,7 +16,7 @@ Zero dependencies. Python 3.10+. Talks to any OpenAI-compatible `/v1/chat/comple
 ```bash
 python -m harness run \
   --task "Find the config file and report the port" \
-  --model qwen2.5-coder-32b \
+  --model <model-id> \
   --endpoint http://localhost:8080/v1 \
   --workdir ./project
 
@@ -190,7 +190,7 @@ from pathlib import Path
 from harness import AgentRuntime, RuntimeConfig, ChatCompletionsTransport
 
 rt = AgentRuntime(registry, ChatCompletionsTransport("http://localhost:8080/v1"),
-                  Path("runs"), model="qwen2.5-coder-32b", config=RuntimeConfig(step_cap=100))
+                  Path("runs"), model="<model-id>", config=RuntimeConfig(step_cap=100))
 result = rt.run("...")
 ```
 
