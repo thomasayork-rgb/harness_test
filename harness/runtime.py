@@ -154,6 +154,7 @@ class RuntimeConfig:
     transport_retries: int = 1
     skill_chars: int = 12000
     progress_nudge_steps: int = 12
+    trust_project_plugins: bool = False   # run a plugin from <workdir>/.harness/skills
 
 
 def config_from(stored: dict | None) -> RuntimeConfig:
@@ -364,6 +365,15 @@ class AgentRuntime:
         if skill.chars > self.config.skill_chars:
             return (f"error: skill '{name}' is {skill.chars} chars, over the {self.config.skill_chars} "
                     "char limit for one skill (--skill-chars). It was not loaded."), "error"
+
+        if (skill.plugin_path is not None and not self.config.trust_project_plugins
+                and self.skills.is_project_skill(skill)):
+            # A project's own .harness/skills is data the run was pointed at, not
+            # code the operator chose to run. Nothing is loaded, so the model is
+            # never told to follow text that relies on tools it cannot have.
+            return (f"error: skill '{name}' bundles a plugin ({skill.plugin}) from the project's own "
+                    ".harness/skills directory, and the harness does not run a project's code unless "
+                    "it was started with --trust-project-plugins. It was not loaded."), "error"
 
         plugin_note = ""
         if skill.plugin_path is not None:

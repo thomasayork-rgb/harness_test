@@ -33,7 +33,7 @@ python -m harness replay <run_id> --workdir ./project   # re-run a recording aga
 
 `--api-key` or `HARNESS_API_KEY` for hosted endpoints. Runs land in `./runs/<run_id>/` (`--runs-dir` to move). Exit codes for `run` and `resume`: `0` completed, `1` blocked/failed, `2` transport_error, `3` step_cap, `4` stalled. For `replay`: `0` identical to the recording, `1` drifted. For `bench`: `0` if every task completed, `1` otherwise. A bad command line — including a run that cannot be resumed — is `64`, an unreadable run directory `66`.
 
-Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--skills ./skills` (repeatable), `--skill-chars 12000`, `--progress-nudge 12`, `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
+Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--skills ./skills` (repeatable), `--skill-chars 12000`, `--progress-nudge 12`, `--trust-project-plugins`, `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
 
 ## Run directory
 
@@ -204,6 +204,12 @@ size limit — a skill larger than `--skill-chars` (default 12000) is refused at
 in the error. Loading a skill twice is a no-op that says so; unloading leaves the tools it activated
 active (`toolbelt_remove` drops them). The header records what was discovered, `skill_load` and
 `skill_unload` are ordinary steps, and `trace --summary` says which skills the run actually read.
+
+A `plugin` is code. A skill from your own directories runs it the moment the skill is loaded; a
+skill from `<workdir>/.harness/skills` came with the project the run was pointed at, so its plugin
+is refused unless the run was started with `--trust-project-plugins`. The refusal loads nothing —
+not the text either — so the model is never told to follow instructions that rely on tools it
+cannot have. `harness skills` marks such skills.
 
 When skills are present the built-in prompt gains a short SKILLS section telling the model to list
 skills before planning and to follow what it loads; a run without skills is sent the prompt it was

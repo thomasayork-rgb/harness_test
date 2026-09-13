@@ -167,6 +167,7 @@ def _build(a: argparse.Namespace, workdir: Path, run_id: str | None) -> AgentRun
         preview_chars=a.preview_chars,
         skill_chars=a.skill_chars,
         progress_nudge_steps=a.progress_nudge,
+        trust_project_plugins=a.trust_project_plugins,
     )
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
                       run_id=run_id, policy=policy, prompt_sources=prompt_sources,
@@ -331,7 +332,8 @@ def _resume(a: argparse.Namespace) -> int:
         rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
                                     step_cap=a.step_cap, policy=policy,
                                     invocation=_invocation(a, workdir, extra, skills),
-                                    skills=skills, progress_nudge_steps=a.progress_nudge)
+                                    skills=skills, progress_nudge_steps=a.progress_nudge,
+                                    trust_project_plugins=a.trust_project_plugins or None)
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
@@ -371,7 +373,8 @@ def _skills(a: argparse.Namespace) -> int:
     width = max((len(e["name"]) for e in entries), default=0)
     for entry in entries:
         skill = found.get(entry["name"])
-        print(f"{entry['name']:<{width}}  {entry['description']}  ({skill.source})")
+        gated = "  [plugin: needs --trust-project-plugins]" if skill.plugin and found.is_project_skill(skill) else ""
+        print(f"{entry['name']:<{width}}  {entry['description']}  ({skill.source}){gated}")
     where = f"{len(found.dirs)} director" + ("y" if len(found.dirs) == 1 else "ies")
     print(f"\n{len(entries)} skill(s) in {where}; "
           "none are in context until the agent calls skill_load", file=sys.stderr)
@@ -508,6 +511,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--progress-nudge", type=int, default=12, metavar="N",
                         help="ask the model to update its plan after N steps with no change "
                              "to any todo (default: 12; 0 disables)")
+        sp.add_argument("--trust-project-plugins", action="store_true",
+                        help="let a skill from <workdir>/.harness/skills register its plugin, "
+                             "which runs that project's own code (default: refuse)")
 
     r = sub.add_parser("run", help="run a task")
     r.add_argument("--task")
@@ -534,6 +540,9 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--progress-nudge", type=int, default=None, metavar="N",
                     help="steps without a todo change before the model is asked to update its "
                          "plan (default: what the run recorded; 0 disables)")
+    rs.add_argument("--trust-project-plugins", action="store_true",
+                    help="let a skill from <workdir>/.harness/skills register its plugin for the "
+                         "rest of the run (default: what the run recorded)")
     prompt_args(rs)      # accepted so the refusal can explain itself, never applied
     rs.set_defaults(fn=_resume)
 

@@ -536,3 +536,144 @@ def register(registry):
     assert "plugin: already registered." in steps[2]["result_preview"]
     assert "already active: count_lines" in steps[2]["result_preview"]
     assert json.loads((res.run_dir / "state.json").read_text())["loaded_skills"] == ["counting"]
+
+
+COUNTING_PLUGIN = '''
+def register(registry, workdir):
+    @registry.tool("count_lines", "Count the lines in a string.",
+                   {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]})
+    def count_lines(text: str) -> dict:
+        return {"lines": len(text.splitlines())}
+'''
+COUNTING_SKILL = "---\ndescription: Count things.\ntools: [count_lines]\nplugin: ./tools.py\n---\nUse count_lines.\n"
+
+
+def project_with_plugin_skill(tmp_path) -> Path:
+    """A workdir whose own .harness/skills carries a skill that brings code."""
+    work = tmp_path / "project"
+    root = work / ".harness" / "skills"
+    write(root / "counting" / "tools.py", COUNTING_PLUGIN)
+    write(root / "counting" / "SKILL.md", COUNTING_SKILL)
+    write(root / "plain" / "SKILL.md", "---\ndescription: No plugin here.\n---\nJust text.\n")
+    return work
+
+
+def test_a_project_skill_with_a_plugin_is_refused_unless_trusted(tmp_path):
+    """A plugin under <workdir>/.harness/skills is the project's own code. By
+    default nothing is loaded - not the text either - and the tool never
+    reaches the registry; a run that opted in gets both."""
+    work = project_with_plugin_skill(tmp_path)
+    found = discover(search_dirs([], work), work)
+    assert found.is_project_skill(found.get("counting")) and found.is_project_skill(found.get("plain"))
+    elsewhere = discover([skills_dir(tmp_path, "mine", investigate=INVESTIGATE)], work)
+    assert not elsewhere.is_project_skill(elsewhere.get("investigate"))
+
+    registry = registry_with_files()
+    fake = FakeTransport([
+        {"content": "Loading the project's skill.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+        {"content": "The plain one, then.", "tool_calls": [call("skill_load", {"name": "plain"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ])
+    rt = AgentRuntime(registry, fake, tmp_path / "runs", "fake", run_id="untrusted", skills=found)
+    res = rt.run("count things")
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:2]] == ["error", "ok"]
+    assert "--trust-project-plugins" in steps[0]["result_preview"]
+    assert "It was not loaded" in steps[0]["result_preview"]
+    assert "count_lines" not in registry
+    assert "Use count_lines." not in json.dumps(fake.requests[1]["messages"])
+    state = json.loads((res.run_dir / "state.json").read_text())
+    assert state["loaded_skills"] == ["plain"]
+
+    registry = registry_with_files()
+    fake = FakeTransport([
+        {"content": "Loading the project's skill.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+        {"content": "Using it.", "tool_calls": [call("count_lines", {"text": "a\nb"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ])
+    rt = AgentRuntime(registry, fake, tmp_path / "runs", "fake", RuntimeConfig(trust_project_plugins=True),
+                      run_id="trusted", skills=discover(search_dirs([], work), work))
+    res = rt.run("count things")
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:2]] == ["ok", "ok"]
+    assert "plugin: registered count_lines." in steps[0]["result_preview"]
+    assert json.loads(steps[1]["result_preview"]) == {"lines": 2}
+
+
+def test_harness_skills_marks_a_project_plugin_as_gated(tmp_path, capsys):
+    work = project_with_plugin_skill(tmp_path)
+    assert main(["skills", "--workdir", str(work), "--filter", "count"]) == 0
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("counting  Count things.")
+    assert line.endswith("[plugin: needs --trust-project-plugins]")
+    assert main(["skills", "--workdir", str(work), "--filter", "plugin"]) == 0
+    assert "[plugin:" not in capsys.readouterr().out          # the plain skill carries no marker
+
+
+def test_cli_refuses_a_project_plugin_without_the_flag_over_http(tmp_path):
+    """A real process, twice over the same script: the project's plugin is
+    refused by default and registered with --trust-project-plugins, and the
+    header records which it was."""
+    work = project_with_plugin_skill(tmp_path)
+    runs = tmp_path / "runs"
+
+    def script():
+        return [
+            {"content": "Loading the project's skill.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+            {"content": "Closing.", "tool_calls": [
+                call("todo_write", {"todos": [{"id": "c", "content": "count", "status": "completed"}]}),
+                call("final_answer", {"status": "completed", "content": "done"})]},
+        ]
+
+    def run(run_id, *flags):
+        with MockOpenAIServer(script(), model="mock-model") as server:
+            proc = subprocess.run(
+                [sys.executable, "-m", "harness", "--runs-dir", str(runs), "run", "--task", "count",
+                 "--model", "mock-model", "--endpoint", server.base_url, "--workdir", str(work),
+                 "--run-id", run_id, *flags],
+                cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+        assert proc.returncode == 0, proc.stderr
+        records = read_trajectory(runs / run_id)
+        return records[0], [r for r in records if r["type"] == "step"]
+
+    header, steps = run("refused")
+    assert steps[0]["kind"] == "error" and "--trust-project-plugins" in steps[0]["result_preview"]
+    assert header["config"]["trust_project_plugins"] is False
+    header, steps = run("trusted", "--trust-project-plugins")
+    assert steps[0]["kind"] == "ok" and "plugin: registered count_lines." in steps[0]["result_preview"]
+    assert header["config"]["trust_project_plugins"] is True
+
+
+def test_resume_can_opt_into_a_project_plugin(tmp_path):
+    """A run that refused the project's plugin is resumed with the flag: the
+    same skill now loads, and the tool it brought is callable."""
+    work = project_with_plugin_skill(tmp_path)
+    runs = tmp_path / "runs"
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
+    first = [{"content": "Loading the project's skill.", "tool_calls": [call("skill_load", {"name": "counting"})]}]
+    with MockOpenAIServer(first, model="mock-model") as server:
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--runs-dir", str(runs), "run", "--task", "count",
+             "--model", "mock-model", "--endpoint", server.base_url, "--workdir", str(work),
+             "--run-id", "capped", "--step-cap", "1"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=120, env=env)
+    assert proc.returncode == 3, proc.stderr                 # step_cap: resumable
+
+    rest = [
+        {"content": "Trying again, trusted now.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+        {"content": "Using it.", "tool_calls": [call("count_lines", {"text": "a\nb"})]},
+        {"content": "Closing.", "tool_calls": [
+            call("todo_write", {"todos": [{"id": "c", "content": "count", "status": "completed"}]}),
+            call("final_answer", {"status": "completed", "content": "2 lines"})]},
+    ]
+    with MockOpenAIServer(rest, model="mock-model") as server:
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--runs-dir", str(runs), "resume", "capped",
+             "--endpoint", server.base_url, "--step-cap", "10", "--trust-project-plugins"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=120, env=env)
+    assert proc.returncode == 0, proc.stderr
+    steps = [r for r in read_trajectory(runs / "capped") if r["type"] == "step"]
+    assert [s["kind"] for s in steps[:3]] == ["error", "ok", "ok"]
+    assert "plugin: registered count_lines." in steps[1]["result_preview"]
+    assert json.loads(steps[2]["result_preview"]) == {"lines": 2}

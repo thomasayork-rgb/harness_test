@@ -98,7 +98,9 @@ examples/skills` drives the shipped ones. A loaded skill's text is protected fro
 exempt from `--result-chars`, which is why it has its own `--skill-chars` ceiling; `skill_unload`
 puts a marker in its place. The header records the directories and names, `resume` restores them
 from `invocation`, and `replay` rediscovers them, so a recorded skills run is still a regression
-test.
+test. A project skill (one found in `<workdir>/.harness/skills`) that declares a `plugin` is refused
+at load unless the run has `--trust-project-plugins`: that plugin is the project's own code, and
+the harness never runs it on the operator's say-so alone.
 
 ### Plugins and policy
 

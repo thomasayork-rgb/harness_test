@@ -221,6 +221,17 @@ class SkillSet:
         needle = (filter or "").strip().lower()
         return [s.brief() for s in self.skills.values() if not needle or s.matches(needle)]
 
+    def is_project_skill(self, skill: Skill) -> bool:
+        """True for a skill found in ``<workdir>/.harness/skills``: it came with
+        the project the run works on, not from the operator's own directories,
+        so anything it can execute is that project's code."""
+        if self.workdir is None:
+            return False
+        try:
+            return skill.source.resolve() == (Path(self.workdir) / PROJECT_RELATIVE).resolve()
+        except OSError:
+            return False
+
     def warnings(self) -> list[str]:
         """Everything discovery wants to say out loud, once."""
         return list(self.errors) + list(self.clashes)
