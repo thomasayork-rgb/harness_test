@@ -110,3 +110,38 @@ def test_trace_cli(tmp_path, capsys):
 
     steps = [x for x in read_trajectory(res.run_dir) if x["type"] == "step"]
     assert len(steps[1]["result_preview"]) == 50 and steps[1]["result_bytes"] == 1200
+
+
+def test_trace_step_points_at_the_turn_it_shares(tmp_path, capsys):
+    """Only the first call of a turn carries reasoning and usage. The later
+    ones used to print `reasoning: (none)` and `tokens: None / None`, which
+    reads like the model said nothing rather than like a shared turn."""
+    r = ToolRegistry()
+    r.register(ToolSpec("echo", "echo", {"type": "object", "properties": {"s": {"type": "string"}},
+                                         "required": ["s"]}, lambda s: s))
+    fake = FakeTransport([
+        {"content": "Adding echo.", "tool_calls": [call("toolbelt_add", {"names": ["echo"]})],
+         "usage": {"prompt_tokens": 10, "completion_tokens": 1}},
+        {"content": "Three echoes in one turn.",
+         "tool_calls": [call("echo", {"s": "one"}), call("echo", {"s": "two"}), call("echo", {"s": "three"})],
+         "usage": {"prompt_tokens": 20, "completion_tokens": 2}},
+        {"content": "Done.", "tool_calls": [
+            call("todo_write", {"todos": [{"id": "1", "content": "x", "status": "completed"}]}),
+            call("final_answer", {"status": "completed", "content": "ok"})]},
+    ])
+    res = AgentRuntime(r, fake, tmp_path, "fake", run_id="turns").run("echo things")
+    assert res.status == "completed" and res.steps == 6
+
+    assert main(["--runs-dir", str(tmp_path), "trace", "turns", "--step", "4"]) == 0
+    out = capsys.readouterr().out
+    assert "step 4  [ok]  echo" in out
+    assert "turn: call 3 of the turn that started at step 2" in out
+    assert "tokens in/out: recorded on step 2" in out
+    assert "(recorded on step 2)" in out and "(none)" not in out
+    assert "None" not in out
+
+    # the first call of a turn still shows its own reasoning and usage
+    assert main(["--runs-dir", str(tmp_path), "trace", "turns", "--step", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "tokens in/out: 20 / 2" in out and "Three echoes in one turn." in out
+    assert "turn:" not in out

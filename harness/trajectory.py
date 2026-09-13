@@ -295,6 +295,21 @@ def format_summary(records: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def turn_start(steps: list[dict], rec: dict) -> int | None:
+    """The step that opened this step's model turn, when that is not this step.
+
+    One turn can issue several tool calls, and only the first carries the
+    turn's reasoning and its token usage - so a later call has nothing of its
+    own to show, and a reader needs pointing at where it went."""
+    index = rec.get("call_index") or 0
+    if not index:
+        return None
+    start = rec["step"] - index
+    if any(r["step"] == start and not (r.get("call_index") or 0) for r in steps):
+        return start
+    return None
+
+
 def format_trace(records: list[dict], run_dir: Path, step: int | None = None) -> str:
     """Readable trace. With ``step`` set, print that step in full (artifact included)."""
     lines: list[str] = []
@@ -304,11 +319,17 @@ def format_trace(records: list[dict], run_dir: Path, step: int | None = None) ->
         rec = next((r for r in steps if r["step"] == step), None)
         if rec is None:
             return f"no step {step} in trajectory"
+        shared = turn_start(steps, rec)
         lines.append(f"step {rec['step']}  [{rec['kind']}]  {rec['tool'] or '(text only)'}  {rec['elapsed_ms']} ms")
-        lines.append(f"tokens in/out: {rec['tokens_in']} / {rec['tokens_out']}")
+        if shared is not None:
+            lines.append(f"turn: call {rec['call_index'] + 1} of the turn that started at step {shared}; "
+                         f"reasoning and token usage are recorded on step {shared}")
+            lines.append(f"tokens in/out: recorded on step {shared}")
+        else:
+            lines.append(f"tokens in/out: {rec['tokens_in']} / {rec['tokens_out']}")
         lines.append("")
         lines.append("reasoning:")
-        lines.append(rec["reasoning"] or "(none)")
+        lines.append(rec["reasoning"] or (f"(recorded on step {shared})" if shared is not None else "(none)"))
         lines.append("")
         lines.append("args:")
         lines.append(json.dumps(rec["args"], indent=2, ensure_ascii=False))
