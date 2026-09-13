@@ -145,3 +145,10 @@ def test_trace_step_points_at_the_turn_it_shares(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "tokens in/out: 20 / 2" in out and "Three echoes in one turn." in out
     assert "turn:" not in out
+
+    # and the step list says so too, instead of leaving the column blank
+    listing = format_trace(read_trajectory(res.run_dir), res.run_dir).splitlines()
+    rows = [line for line in listing if line[:6].strip().isdigit()]
+    assert rows[1].endswith("Three echoes in one turn.")
+    assert rows[2].endswith("(continues the turn of step 2)")
+    assert rows[3].endswith("(continues the turn of step 2)")

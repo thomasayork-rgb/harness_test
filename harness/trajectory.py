@@ -359,6 +359,10 @@ def format_trace(records: list[dict], run_dir: Path, step: int | None = None) ->
             reasoning = (rec["reasoning"] or "").strip().replace("\n", " ")
             if len(reasoning) > 160:
                 reasoning = reasoning[:157] + "..."
+            if not reasoning:
+                shared = turn_start(steps, rec)
+                if shared is not None:
+                    reasoning = f"(continues the turn of step {shared})"
             lines.append(f"{rec['step']:>4}  {rec['kind']:<15} {tool:<22} {rec['elapsed_ms']:>6} ms  {reasoning}")
         elif kind == "footer":
             lines.append("")
