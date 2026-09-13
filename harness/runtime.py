@@ -111,7 +111,6 @@ SKILL_META_TOOLS: list[dict] = [
     }},
 ]
 SKILL_META_NAMES = {t["function"]["name"] for t in SKILL_META_TOOLS}
-ALL_META_NAMES = META_NAMES | SKILL_META_NAMES
 
 # Statuses a run can be picked up from. completed/blocked/failed are answers,
 # not interruptions, and "running" means some other process still owns the run.
@@ -395,7 +394,7 @@ class AgentRuntime:
             parts.append("already active: " + ", ".join(already))
         if unknown:
             parts.append("declared but unknown: " + ", ".join(unknown))
-        tools_note = ("tools: " + "; ".join(parts) + "." if parts else "No tools declared.")
+        tools_note = ("tools: " + "; ".join(parts) + ".") if parts else "No tools declared."
 
         self.state.loaded_skills.append(name)
         self._annotate = {"_protected": True, "_skill": name, "_full": True}
