@@ -5,6 +5,7 @@
                  [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
   harness resume <run_id> [--step-cap N]   (provider flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
+  harness skills [--skills DIR] [--workdir d] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
   harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
   harness trace  <run_id> [--step N | --summary]
@@ -34,6 +35,7 @@ from .registry import ToolRegistry
 from .replay import compare
 from .resume import prepare as prepare_resume, recorded_invocation, recorded_policy
 from .runtime import AgentRuntime, ResumeError, RuntimeConfig
+from .skills import SkillSet, discover, search_dirs
 from .tools import register_default_tools, register_scratch_tools
 from .trajectory import format_summary, format_trace, read_trajectory, summarize
 from .replay import replay as replay_run
@@ -85,9 +87,11 @@ def _policy(a: argparse.Namespace, recorded: Any = None) -> ToolPolicy | None:
     return recorded
 
 
-def _invocation(a: argparse.Namespace, workdir: Path, extra: dict) -> dict:
-    """What a resume needs to reach the same provider with the same tools.
-    Deliberately never the API key: it would end up in the run directory."""
+def _invocation(a: argparse.Namespace, workdir: Path, extra: dict,
+                skills: SkillSet | None = None) -> dict:
+    """What a resume needs to reach the same provider with the same tools and
+    the same skills. Deliberately never the API key: it would end up in the run
+    directory."""
     return {
         "endpoint": a.endpoint,
         "provider": a.provider,
@@ -95,15 +99,16 @@ def _invocation(a: argparse.Namespace, workdir: Path, extra: dict) -> dict:
         "timeout": a.timeout,
         "extra_body": dict(extra),
         "tools": list(a.tools or []),
+        "skills": [str(d) for d in (skills.dirs if skills else [])],
         "workdir": str(workdir),
     }
 
 
-def _system_prompt(a: argparse.Namespace) -> tuple[str, list[dict]]:
+def _system_prompt(a: argparse.Namespace, skills: bool = False) -> tuple[str, list[dict]]:
     """The effective system prompt and its provenance, for the prompt flags.
     Raises PromptError for a file that was named and cannot be read."""
     return resolve_system_prompt(a.system_prompt, a.append_system_prompt or [],
-                                 use_global=not a.no_global_prompt)
+                                 use_global=not a.no_global_prompt, skills=skills)
 
 
 def _prompt_flags_given(a: argparse.Namespace) -> list[str]:
@@ -122,24 +127,43 @@ def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
     return registry
 
 
+def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None) -> SkillSet:
+    """What this command line can see. ``recorded`` is the directory list a run
+    already searched: with no --skills given, a resume keeps it rather than
+    re-resolving an environment that may have moved.
+
+    Whatever discovery wants to say - a broken skill file, a name found twice -
+    is said once, here, and never to the model.
+    """
+    flags = list(getattr(a, "skills", None) or [])
+    dirs = [Path(d) for d in recorded] if (recorded is not None and not flags) else \
+        search_dirs(flags, workdir)
+    found = discover(dirs, workdir)
+    for line in found.warnings():
+        print(f"skills: {line}", file=sys.stderr)
+    return found
+
+
 def _build(a: argparse.Namespace, workdir: Path, run_id: str | None) -> AgentRuntime:
     """Everything one run needs, assembled from the command line. Raises
     PluginError, ValueError or PromptError; nothing is created until they pass."""
     registry = _registry(a, workdir)
+    skills = _discover_skills(a, workdir)
     extra = _extra_body(a.extra_body)
     transport = _transport(a, extra)
     policy = _policy(a)
-    system_prompt, prompt_sources = _system_prompt(a)
+    system_prompt, prompt_sources = _system_prompt(a, skills=bool(skills))
     cfg = RuntimeConfig(
         step_cap=a.step_cap,
         require_todos=not a.no_todo_gate,
         result_context_chars=a.result_chars,
         context_budget_chars=a.context_chars,
         preview_chars=a.preview_chars,
+        skill_chars=a.skill_chars,
     )
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
                       run_id=run_id, policy=policy, prompt_sources=prompt_sources,
-                      invocation=_invocation(a, workdir, extra))
+                      invocation=_invocation(a, workdir, extra, skills), skills=skills)
     # the scratch pad lives in the run directory, so it can only be rooted now
     register_scratch_tools(registry, rt.run_dir)
     return rt
@@ -284,6 +308,7 @@ def _resume(a: argparse.Namespace) -> int:
     except PluginError as e:
         print(f"resume: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
+    skills = _discover_skills(a, workdir, recorded=rec.get("skills"))
     try:
         extra = _extra_body(a.extra_body) if a.extra_body else dict(rec.get("extra_body") or {})
         transport = _transport(a, extra)
@@ -293,11 +318,13 @@ def _resume(a: argparse.Namespace) -> int:
         return USAGE_ERROR
 
     print(f"{a.provider} at {a.endpoint}  workdir {workdir}"
-          + (f"  tools {', '.join(a.tools)}" if a.tools else ""), file=sys.stderr)
+          + (f"  tools {', '.join(a.tools)}" if a.tools else "")
+          + (f"  skills {len(skills)}" if skills else ""), file=sys.stderr)
     try:
         rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
                                     step_cap=a.step_cap, policy=policy,
-                                    invocation=_invocation(a, workdir, extra))
+                                    invocation=_invocation(a, workdir, extra, skills),
+                                    skills=skills)
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
@@ -330,10 +357,26 @@ def _tools(a: argparse.Namespace) -> int:
     return 0
 
 
+def _skills(a: argparse.Namespace) -> int:
+    """What the agent could load, and where each came from."""
+    found = _discover_skills(a, Path(a.workdir).resolve())
+    entries = found.list(a.filter)
+    width = max((len(e["name"]) for e in entries), default=0)
+    for entry in entries:
+        skill = found.get(entry["name"])
+        print(f"{entry['name']:<{width}}  {entry['description']}  ({skill.source})")
+    where = f"{len(found.dirs)} director" + ("y" if len(found.dirs) == 1 else "ies")
+    print(f"\n{len(entries)} skill(s) in {where}; "
+          "none are in context until the agent calls skill_load", file=sys.stderr)
+    for directory in found.dirs:
+        print(f"  {directory}", file=sys.stderr)
+    return 0
+
+
 def _prompt(a: argparse.Namespace) -> int:
     """Print the system prompt a run would start with, or where it came from."""
     try:
-        text, sources = _system_prompt(a)
+        text, sources = _system_prompt(a, skills=bool(_discover_skills(a, None)))
     except PromptError as e:
         print(f"prompt: {e}", file=sys.stderr)
         return USAGE_ERROR
@@ -396,6 +439,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     tools_help = ("module exporting `registry` or `register(registry)`; dotted name or path "
                   "to a .py file. Repeatable.")
+    skills_help = ("directory of skills (<name>/SKILL.md or <name>.md), merged with "
+                   "$HARNESS_SKILLS, the config directory and <workdir>/.harness/skills. "
+                   "Repeatable; a later one wins a name clash.")
 
     def prompt_args(sp) -> None:
         """How the system prompt is assembled. Shared by run, resume and prompt."""
@@ -437,6 +483,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--workdir", default=None if recorded else ".",
                         help="root for fs_* and run_shell tools" + (was if recorded else ""))
         sp.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
+        sp.add_argument("--skills", action="append", metavar="DIR", help=skills_help)
         sp.add_argument("--deny-tool", action="append", metavar="NAME",
                         help="refuse this tool; the model sees the refusal as the result. Repeatable.")
         sp.add_argument("--deny-shell-pattern", action="append", metavar="REGEX",
@@ -449,6 +496,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--result-chars", type=int, default=2000)
         sp.add_argument("--context-chars", type=int, default=60000)
         sp.add_argument("--preview-chars", type=int, default=400)
+        sp.add_argument("--skill-chars", type=int, default=12000,
+                        help="refuse to load a skill larger than this (default: 12000)")
 
     r = sub.add_parser("run", help="run a task")
     r.add_argument("--task")
@@ -475,6 +524,12 @@ def build_parser() -> argparse.ArgumentParser:
     prompt_args(rs)      # accepted so the refusal can explain itself, never applied
     rs.set_defaults(fn=_resume)
 
+    sk = sub.add_parser("skills", help="list discovered skills (what the agent can load)")
+    sk.add_argument("--workdir", default=".", help="project whose .harness/skills is searched")
+    sk.add_argument("--skills", action="append", metavar="DIR", help=skills_help)
+    sk.add_argument("--filter", default=None, help="keyword filter, like skill_list")
+    sk.set_defaults(fn=_skills)
+
     l = sub.add_parser("tools", help="list registered tools (what the agent can discover)")
     l.add_argument("--workdir", default=".", help="root the fs_* tools would be given")
     l.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
@@ -483,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     pr = sub.add_parser("prompt", help="print the system prompt a run would start with")
     prompt_args(pr)
+    pr.add_argument("--skills", action="append", metavar="DIR", help=skills_help)
     pr.add_argument("--sources", action="store_true",
                     help="print where each layer of the prompt came from instead of the prompt")
     pr.set_defaults(fn=_prompt)

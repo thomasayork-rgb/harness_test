@@ -364,7 +364,7 @@ def test_resume_defaults_every_provider_flag_from_the_recording(tmp_path):
     invocation = recs[0]["invocation"]
     assert invocation == {"endpoint": server.base_url, "provider": "openai", "max_tokens": 4096,
                           "timeout": 120.0, "extra_body": {"temperature": 0},
-                          "tools": [str(plugin)], "workdir": str(work)}
+                          "tools": [str(plugin)], "skills": [], "workdir": str(work)}
     seam = next(r for r in recs if r["type"] == "resume")
     assert seam["invocation"] == invocation                        # carried forward for the next one
     assert seam["policy"] == {"deny_tools": [], "deny_shell_patterns": [r"rm\s+-rf"],

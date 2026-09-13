@@ -6,17 +6,23 @@ points HOME at a throwaway directory, so nothing reads the machine's own
 """
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from harness.cli import main
 from harness.context import EVICTED
+from harness.mockserver import MockOpenAIServer
 from harness.registry import ToolRegistry, ToolSpec
 from harness.runtime import META_NAMES, SKILL_META_NAMES, AgentRuntime, RuntimeConfig
 from harness.skills import (NoFrontmatter, SkillError, discover, load_skill,
                             parse_frontmatter, search_dirs)
 from harness.trajectory import format_summary, read_trajectory, summarize
 from harness.transport import FakeTransport, call
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 INVESTIGATE = """---
 description: Answer a question about a codebase with evidence.
@@ -367,3 +373,115 @@ def test_the_header_and_the_summary_say_which_skills_were_there_and_which_were_r
     assert s["skills_available"] == ["investigate", "tidy-up"] and s["skills_loaded"] == ["investigate"]
     assert s["skill_dirs"] == [str(root)]
     assert "skills: loaded investigate  (2 discovered in 1 directory)" in format_summary(records)
+
+
+# ---- the CLI --------------------------------------------------------------
+
+
+def test_harness_skills_lists_what_the_agent_could_load(tmp_path, capsys, monkeypatch):
+    first = skills_dir(tmp_path, "first", investigate=INVESTIGATE, tidy=TIDY)
+    second = skills_dir(tmp_path, "second")
+    write(second / "tidy" / "SKILL.md", "---\nname: tidy-up\ndescription: The project's own tidy.\n---\nmine\n")
+    work = tmp_path / "project"
+    (work / ".harness" / "skills").mkdir(parents=True)
+
+    assert main(["skills", "--skills", str(first), "--skills", str(second), "--workdir", str(work)]) == 0
+    out = capsys.readouterr()
+    assert out.out.splitlines() == [
+        f"investigate  Answer a question about a codebase with evidence.  ({first})",
+        f"tidy-up      The project's own tidy.  ({second})"]
+    assert "2 skill(s) in 3 directories" in out.err            # the empty project one was searched
+    assert f"skill 'tidy-up': using {second / 'tidy' / 'SKILL.md'}" in out.err
+    assert str(first / "tidy" / "SKILL.md") in out.err         # the clash names both, once
+    assert out.err.count("skill 'tidy-up'") == 1
+
+    assert main(["skills", "--skills", str(first), "--filter", "codebase"]) == 0
+    assert capsys.readouterr().out.strip().startswith("investigate")
+    assert main(["skills", "--workdir", str(work)]) == 0       # nothing anywhere: no output, no crash
+    assert capsys.readouterr().out == ""
+
+
+def test_the_shipped_examples_are_loadable_skills():
+    found = discover([REPO_ROOT / "examples" / "skills"])
+    assert found.names() == ["code-change", "final-report", "investigate"]
+    assert found.errors == [] and found.clashes == []
+    assert found.get("code-change").tools == ["fs_search", "fs_read", "fs_edit", "run_shell"]
+    assert "fs_edit" in found.get("code-change").body
+    assert all(s.chars < 12000 for s in found.skills.values())   # under the default --skill-chars
+
+
+def test_cli_run_with_skills_over_http(tmp_path):
+    """A real process: the SKILLS section reaches the model only because skills
+    were found, and the skill the model loaded reaches it as a tool result."""
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE)
+    work = tmp_path / "project"
+    work.mkdir()
+    (work / "config.ini").write_text("[server]\nPORT = 8080\n", encoding="utf-8")
+    runs = tmp_path / "runs"
+    script = [
+        {"content": "Any skills for this?", "tool_calls": [call("skill_list", {})]},
+        {"content": "investigate matches; loading it.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Following it: search first.",
+         "tool_calls": [call("fs_search", {"pattern": "(?i)port"})]},
+        {"content": "Done with the guide.", "tool_calls": [call("skill_unload", {"name": "investigate"})]},
+        {"content": "Closing.", "tool_calls": [
+            call("todo_write", {"todos": [{"id": "find", "content": "find the port", "status": "completed"}]}),
+            call("final_answer", {"status": "completed", "content": "8080, config.ini:2"})]},
+    ]
+    with MockOpenAIServer(script, model="mock-model") as server:
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--runs-dir", str(runs), "run", "--task", "find the port",
+             "--model", "mock-model", "--endpoint", server.base_url, "--workdir", str(work),
+             "--skills", str(root), "--run-id", "skilled"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+        bodies = [r["body"] for r in server.requests]
+
+    assert proc.returncode == 0, proc.stderr
+    system = bodies[0]["messages"][0]["content"]
+    assert "SKILLS. Written guides" in system and "skill_load(name)" in system
+    assert {t["function"]["name"] for t in bodies[0]["tools"]} == META_NAMES | SKILL_META_NAMES
+    # the skill text was in context for the search turn, and gone after the unload
+    assert "fs_glob for the shape of the tree." in json.dumps(bodies[2]["messages"])
+    assert "fs_glob for the shape of the tree." not in json.dumps(bodies[4]["messages"])
+    assert "unloaded" in json.dumps(bodies[4]["messages"])
+    records = read_trajectory(runs / "skilled")
+    # fs_search was never activated by hand: loading the skill declared it
+    assert "toolbelt_add" not in [r.get("tool") for r in records]
+    assert records[0]["skills"] == {"dirs": [str(root)], "names": ["investigate"]}
+    assert records[0]["invocation"]["skills"] == [str(root)]
+    assert summarize(records)["skills_loaded"] == ["investigate"]
+
+
+def test_resume_keeps_the_skills_the_run_was_launched_with(tmp_path):
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE)
+    work, runs = tmp_path / "project", tmp_path / "runs"
+    work.mkdir()
+    first = [{"content": "Planning.", "tool_calls": [
+        call("todo_write", {"todos": [{"id": "1", "content": "read the guide", "status": "in_progress"}]})]}]
+    with MockOpenAIServer(first, model="mock-model") as server:
+        rc = main(["--runs-dir", str(runs), "run", "--task", "t", "--model", "mock-model",
+                   "--endpoint", server.base_url, "--workdir", str(work), "--run-id", "res",
+                   "--skills", str(root), "--step-cap", "1"])
+    assert rc == 3
+
+    rest = [{"content": "Loading the skill after the resume.",
+             "tool_calls": [call("skill_load", {"name": "investigate"})]},
+            {"content": "Closing.", "tool_calls": [
+                call("todo_write", {"todos": [{"id": "1", "content": "read the guide",
+                                               "status": "completed"}]})]},
+            {"content": "Done.", "tool_calls": [FINISH]}]
+    with MockOpenAIServer(rest, model="mock-model") as server:
+        rc = main(["--runs-dir", str(runs), "resume", "res", "--endpoint", server.base_url,
+                   "--step-cap", "8"])
+        tools = [{t["function"]["name"] for t in r["body"]["tools"]} for r in server.requests]
+    assert rc == 0
+
+    records = read_trajectory(runs / "res")
+    steps = [r for r in records if r["type"] == "step"]
+    assert [(s["tool"], s["kind"]) for s in steps] == [
+        ("todo_write", "ok"), ("skill_load", "ok"), ("todo_write", "ok"), ("final_answer", "final_accepted")]
+    assert SKILL_META_NAMES <= tools[0]                       # the resumed segment still had them
+    assert "fs_glob for the shape of the tree." in (runs / "res" / steps[1]["artifact"]).read_text()
+    seam = next(r for r in records if r["type"] == "resume")
+    assert seam["invocation"]["skills"] == [str(root)]        # recorded again, for the next resume

@@ -26,6 +26,7 @@ from typing import Any
 from .policy import from_description
 from .registry import ToolRegistry
 from .runtime import AgentRuntime, RunResult, RuntimeConfig, effective_config
+from .skills import discover
 from .tools.scratch import register_scratch_tools
 from .trajectory import last, read_trajectory, setting
 from .transport import TransportError, public_messages
@@ -91,6 +92,15 @@ class ReplayTransport:
         return from_description(setting(self.records, "policy"))
 
     @property
+    def skills(self) -> Any:
+        """The skills the recording could load, rediscovered from the
+        directories the header names. Without them a recorded skill_load would
+        come back "unknown tool" and drag every later step into drift."""
+        recorded = setting(self.records, "skills") or {}
+        return discover(recorded.get("dirs") or [],
+                        (setting(self.records, "invocation") or {}).get("workdir"))
+
+    @property
     def config(self) -> RuntimeConfig:
         """The config the recording ended under, as far as this version of the
         harness understands it. A resumed recording may have raised the step
@@ -110,7 +120,7 @@ class ReplayTransport:
 
 def replay(run_dir: Any, registry: ToolRegistry, runs_dir: Path | None = None,
            run_id: str | None = None, config: RuntimeConfig | None = None,
-           policy: Any = None) -> RunResult:
+           policy: Any = None, skills: Any = None) -> RunResult:
     """Re-drive a recorded run against ``registry``. Returns the new RunResult.
 
     The policy defaults to the one the recording ran under, so denied calls
@@ -126,7 +136,8 @@ def replay(run_dir: Any, registry: ToolRegistry, runs_dir: Path | None = None,
     runtime = AgentRuntime(registry, transport, target, transport.model,
                            config or transport.config,
                            policy=policy if policy is not None else transport.policy,
-                           run_id=run_id or f"{transport.run_id}-replay")
+                           run_id=run_id or f"{transport.run_id}-replay",
+                           skills=skills if skills is not None else transport.skills)
     if "scratch_write" not in registry:
         register_scratch_tools(registry, runtime.run_dir)
     return runtime.run(transport.task)

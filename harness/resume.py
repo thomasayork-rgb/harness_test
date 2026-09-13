@@ -37,6 +37,12 @@ def recorded_invocation(records: list[dict]) -> dict:
     return setting(records, "invocation") or {}
 
 
+def recorded_skill_dirs(records: list[dict]) -> list[str]:
+    """The skill directories the last segment searched. ``[]`` for a run that
+    had none, or one recorded before skills existed."""
+    return list(recorded_invocation(records).get("skills") or [])
+
+
 def recorded_policy(records: list[dict]) -> Any:
     """The tool-call policy the last segment ran under, rebuilt, or None."""
     return from_description(setting(records, "policy"))
@@ -65,12 +71,15 @@ def prepare(
     step_cap: int | None = None,
     policy: Any = None,
     invocation: dict | None = None,
+    skills: Any = None,
 ) -> tuple[AgentRuntime, str | None]:
     """Rebuild the runtime for a resumable run. Returns it with the detail of
     the footer that closed the previous segment, for ``AgentRuntime.resume``.
 
     ``invocation`` is what the new segment runs under, recorded at the seam for
-    the next resume; it defaults to what the recording already says."""
+    the next resume; it defaults to what the recording already says. ``skills``
+    is the skill set the next segment can load from - a run that could load
+    skills before must still be able to after."""
     path = Path(run_dir)
     state, records = load(path)
     if state.status not in RESUMABLE:
@@ -82,7 +91,8 @@ def prepare(
         config.step_cap = step_cap
     runtime = AgentRuntime(registry, transport, path.parent, model or state.model, config,
                            run_id=path.name, state=state, policy=policy,
-                           invocation=invocation or recorded_invocation(records))
+                           invocation=invocation or recorded_invocation(records),
+                           skills=skills)
     return runtime, last(records, "footer").get("detail")
 
 
@@ -95,8 +105,9 @@ def resume(
     step_cap: int | None = None,
     policy: Any = None,
     invocation: dict | None = None,
+    skills: Any = None,
 ) -> RunResult:
     """Continue a run in place. The trajectory grows; it is not replaced."""
     runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap,
-                              policy=policy, invocation=invocation)
+                              policy=policy, invocation=invocation, skills=skills)
     return runtime.resume(detail)
