@@ -13,6 +13,7 @@ Full tool results are written to ``artifacts/`` beside the JSONL so
 """
 from __future__ import annotations
 
+import calendar
 import json
 import re
 import time
@@ -115,6 +116,76 @@ def read_trajectory(run_dir: Path) -> list[dict]:
             if line:
                 records.append(json.loads(line))
     return records
+
+
+def _epoch(ts: str | None) -> float | None:
+    try:
+        return calendar.timegm(time.strptime(ts or "", "%Y-%m-%dT%H:%M:%SZ"))
+    except (ValueError, TypeError):
+        return None
+
+
+def summarize(records: list[dict]) -> dict:
+    """Run stats from the JSONL: status, step kinds, per-tool counts, tokens, elapsed."""
+    header = next((r for r in records if r["type"] == "header"), None) or {}
+    footer = next((r for r in records if r["type"] == "footer"), None) or {}
+    steps = [r for r in records if r["type"] == "step"]
+
+    kinds: dict[str, int] = {}
+    tools: dict[str, int] = {}
+    tokens_in = tokens_out = elapsed_ms = 0
+    for r in steps:
+        kinds[r["kind"]] = kinds.get(r["kind"], 0) + 1
+        name = r["tool"] or "(text only)"
+        tools[name] = tools.get(name, 0) + 1
+        tokens_in += r.get("tokens_in") or 0
+        tokens_out += r.get("tokens_out") or 0
+        elapsed_ms += r.get("elapsed_ms") or 0
+
+    start, end = _epoch(header.get("ts")), _epoch(footer.get("ts"))
+    return {
+        "run_id": header.get("run_id") or footer.get("run_id"),
+        "model": header.get("model"),
+        "harness_version": header.get("harness_version"),
+        "task": header.get("task"),
+        "step_cap": header.get("step_cap"),
+        "status": footer.get("status", "incomplete"),
+        "detail": footer.get("detail"),
+        "steps": footer.get("steps", len(steps)),
+        "final": footer.get("final"),
+        "kinds": dict(sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "tools": dict(sorted(tools.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "errors": kinds.get("error", 0),
+        "rejected_finals": kinds.get("final_rejected", 0),
+        "text_only": kinds.get("text_only", 0),
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "elapsed_ms": elapsed_ms,
+        "wall_s": None if start is None or end is None else round(end - start, 1),
+    }
+
+
+def format_summary(records: list[dict]) -> str:
+    """One screen of run stats. ``harness trace <run_id> --summary``."""
+    s = summarize(records)
+    lines = [f"run {s['run_id']}  model={s['model']}  harness {s['harness_version']}  cap={s['step_cap']}"]
+    if s["task"]:
+        lines.append(f"task: {str(s['task'])[:200]}")
+    lines.append(f"status: {s['status']}  steps: {s['steps']}" + (f"  ({s['detail']})" if s["detail"] else ""))
+    wall = "?" if s["wall_s"] is None else f"{s['wall_s']:g}"
+    lines.append(f"elapsed: {s['elapsed_ms'] / 1000:.1f} s in steps, {wall} s wall")
+    lines.append(f"tokens: {s['tokens_in']} in / {s['tokens_out']} out")
+    lines.append(f"errors: {s['errors']}  rejected finals: {s['rejected_finals']}  text-only turns: {s['text_only']}")
+    lines.append("kinds: " + (", ".join(f"{k} {n}" for k, n in s["kinds"].items()) or "(none)"))
+    lines.append("tools:")
+    width = max((len(t) for t in s["tools"]), default=0)
+    for name, n in s["tools"].items():
+        lines.append(f"  {name:<{width}}  {n}")
+    if not s["tools"]:
+        lines.append("  (none)")
+    if s["final"]:
+        lines.append(f"final [{s['final'].get('status')}]: {str(s['final'].get('content'))[:500]}")
+    return "\n".join(lines)
 
 
 def format_trace(records: list[dict], run_dir: Path, step: int | None = None) -> str:

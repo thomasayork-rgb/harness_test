@@ -2,7 +2,7 @@
 
   harness run   --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
   harness tools [--tools mod] [--filter kw]
-  harness trace <run_id> [--step N]
+  harness trace <run_id> [--step N | --summary]
 
 Exit codes for run: 0 completed, 1 blocked/failed, 2 transport_error,
 3 step_cap, 4 stalled. A bad command line (no task, unloadable --tools) is 64.
@@ -18,7 +18,7 @@ from .plugins import PluginError, load_all
 from .registry import ToolRegistry
 from .runtime import AgentRuntime, RuntimeConfig
 from .tools import register_default_tools
-from .trajectory import format_trace, read_trajectory
+from .trajectory import format_summary, format_trace, read_trajectory
 from .transport import ChatCompletionsTransport
 
 EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3, "stalled": 4}
@@ -94,7 +94,7 @@ def _trace(a: argparse.Namespace) -> int:
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         return 66
-    print(format_trace(records, run_dir, step=a.step))
+    print(format_summary(records) if a.summary else format_trace(records, run_dir, step=a.step))
     return 0
 
 
@@ -131,7 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     t = sub.add_parser("trace", help="print a readable trace of a run")
     t.add_argument("run_id")
-    t.add_argument("--step", type=int, default=None, help="print one step in full")
+    view = t.add_mutually_exclusive_group()
+    view.add_argument("--step", type=int, default=None, help="print one step in full")
+    view.add_argument("--summary", action="store_true", help="print run stats instead of the step list")
     t.set_defaults(fn=_trace)
     return p
 
