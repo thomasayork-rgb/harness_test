@@ -485,3 +485,24 @@ def test_resume_keeps_the_skills_the_run_was_launched_with(tmp_path):
     assert "fs_glob for the shape of the tree." in (runs / "res" / steps[1]["artifact"]).read_text()
     seam = next(r for r in records if r["type"] == "resume")
     assert seam["invocation"]["skills"] == [str(root)]        # recorded again, for the next resume
+
+
+def test_a_recorded_skills_run_replays_as_a_skills_run(tmp_path):
+    """replay rebuilds the skill set from the header, the way it rebuilds the
+    policy: otherwise a recorded skill_load comes back "unknown tool" and every
+    later step drifts."""
+    from harness.replay import ReplayTransport, compare, replay
+
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE)
+    script = [
+        {"content": "Loading.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Using what it activated.", "tool_calls": [call("fs_search", {})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, _, _ = run_with_skills(tmp_path, script, [root], run_id="tape")
+    assert [s["kind"] for s in steps_of(res)] == ["ok", "ok", "ok", "final_accepted"]
+
+    transport = ReplayTransport(res.run_dir)
+    assert transport.skills.names() == ["investigate"]
+    again = replay(res.run_dir, registry_with_files(), runs_dir=tmp_path / "runs")
+    assert again.status == "completed" and compare(res.run_dir, again.run_dir) == []
