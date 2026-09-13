@@ -6,12 +6,13 @@
   harness resume <run_id> --endpoint http://host:port/v1 [--step-cap N]
   harness tools  [--tools mod] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
+  harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
   harness trace  <run_id> [--step N | --summary]
   harness replay <run_id> [--workdir d] [--tools mod] [--deny-tool NAME]
 
 Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
 transport_error, 3 step_cap, 4 stalled. For replay: 0 identical to the
-recording, 1 drifted. A bad command line (no task, unloadable --tools, a run
+recording, 1 drifted. For bench: 0 if every task completed, 1 otherwise. A bad command line (no task, unloadable --tools, a run
 that cannot be resumed) is 64; an unreadable run directory is 66.
 """
 from __future__ import annotations
@@ -20,6 +21,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,7 +34,7 @@ from .replay import compare
 from .resume import prepare as prepare_resume, recorded_invocation, recorded_policy
 from .runtime import AgentRuntime, ResumeError, RuntimeConfig
 from .tools import register_default_tools, register_scratch_tools
-from .trajectory import format_summary, format_trace, read_trajectory
+from .trajectory import format_summary, format_trace, read_trajectory, summarize
 from .replay import replay as replay_run
 from .transport import ChatCompletionsTransport, Transport
 
@@ -119,6 +121,29 @@ def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
     return registry
 
 
+def _build(a: argparse.Namespace, workdir: Path, run_id: str | None) -> AgentRuntime:
+    """Everything one run needs, assembled from the command line. Raises
+    PluginError, ValueError or PromptError; nothing is created until they pass."""
+    registry = _registry(a, workdir)
+    extra = _extra_body(a.extra_body)
+    transport = _transport(a, extra)
+    policy = _policy(a)
+    system_prompt, prompt_sources = _system_prompt(a)
+    cfg = RuntimeConfig(
+        step_cap=a.step_cap,
+        require_todos=not a.no_todo_gate,
+        result_context_chars=a.result_chars,
+        context_budget_chars=a.context_chars,
+        preview_chars=a.preview_chars,
+    )
+    rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
+                      run_id=run_id, policy=policy, prompt_sources=prompt_sources,
+                      invocation=_invocation(a, workdir, extra))
+    # the scratch pad lives in the run directory, so it can only be rooted now
+    register_scratch_tools(registry, rt.run_dir)
+    return rt
+
+
 def _run(a: argparse.Namespace) -> int:
     if a.task_file:
         task = Path(a.task_file).read_text(encoding="utf-8")
@@ -129,43 +154,103 @@ def _run(a: argparse.Namespace) -> int:
         return USAGE_ERROR
     workdir = Path(a.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
-
     try:
-        registry = _registry(a, workdir)
+        rt = _build(a, workdir, a.run_id)
     except PluginError as e:
         print(f"run: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
-    try:
-        extra = _extra_body(a.extra_body)
-        transport = _transport(a, extra)
-        policy = _policy(a)
-    except ValueError as e:
+    except (ValueError, PromptError) as e:
         print(f"run: {e}", file=sys.stderr)
         return USAGE_ERROR
-    try:
-        system_prompt, prompt_sources = _system_prompt(a)
-    except PromptError as e:
-        print(f"run: {e}", file=sys.stderr)
-        return USAGE_ERROR
-
-    cfg = RuntimeConfig(
-        step_cap=a.step_cap,
-        require_todos=not a.no_todo_gate,
-        result_context_chars=a.result_chars,
-        context_budget_chars=a.context_chars,
-        preview_chars=a.preview_chars,
-    )
-    rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
-                      run_id=a.run_id, policy=policy, prompt_sources=prompt_sources,
-                      invocation=_invocation(a, workdir, extra))
-    # the scratch pad lives in the run directory, so it can only be rooted now
-    register_scratch_tools(registry, rt.run_dir)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
     res = rt.run(task)
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
     if res.final:
         print(res.final.get("content", ""))
     return EXIT.get(res.status, 1)
+
+
+BENCH_FILE = "bench.jsonl"
+# (heading, row key, right-align)
+BENCH_COLUMNS = (("run id", "run_id", False), ("status", "status", False), ("steps", "steps", True),
+                 ("tokens in", "tokens_in", True), ("tokens out", "tokens_out", True),
+                 ("elapsed", "elapsed", True))
+
+
+def _bench_tasks(path: Path) -> list[dict]:
+    """One task per JSONL line: {"task": str, "workdir": str?, "run_id": str?}.
+    Raises ValueError naming the line that is wrong."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"{path}: {e.strerror or e}") from None
+    tasks = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{path}:{n}: not valid JSON: {e}") from None
+        if not isinstance(entry, dict) or not isinstance(entry.get("task"), str) or not entry["task"].strip():
+            raise ValueError(f'{path}:{n}: each line needs a non-empty "task" string')
+        tasks.append(entry)
+    if not tasks:
+        raise ValueError(f"{path}: no tasks")
+    return tasks
+
+
+def _bench(a: argparse.Namespace) -> int:
+    """Run a file of tasks back to back under one set of flags, and tabulate."""
+    try:
+        tasks = _bench_tasks(a.tasks)
+    except ValueError as e:
+        print(f"bench: {e}", file=sys.stderr)
+        return USAGE_ERROR
+
+    rows: list[dict] = []
+    for n, entry in enumerate(tasks, 1):
+        workdir = Path(entry.get("workdir") or a.workdir).resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+        try:
+            rt = _build(a, workdir, entry.get("run_id"))
+        except PluginError as e:
+            print(f"bench: --tools {e}", file=sys.stderr)
+            return USAGE_ERROR
+        except (ValueError, PromptError) as e:
+            print(f"bench: {e}", file=sys.stderr)
+            return USAGE_ERROR
+        print(f"[{n}/{len(tasks)}] {rt.run_id}  {entry['task'][:60]}", file=sys.stderr)
+        res = rt.run(entry["task"])
+        stats = summarize(read_trajectory(res.run_dir))
+        rows.append({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+            "run_id": res.run_id, "task": entry["task"], "workdir": str(workdir),
+            "status": res.status, "steps": res.steps,
+            "tokens_in": stats["tokens_in"], "tokens_out": stats["tokens_out"],
+            "elapsed_ms": stats["elapsed_ms"], "wall_s": stats["wall_s"],
+            "errors": stats["errors"], "denied": stats["denied"], "final": res.final,
+        })
+
+    path = Path(a.runs_dir) / BENCH_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:      # appended: a bench log, not a snapshot
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    table = [[label for label, _, _ in BENCH_COLUMNS]]
+    for row in rows:
+        cells = dict(row, elapsed=f"{row['elapsed_ms'] / 1000:.1f} s")
+        table.append([str(cells[key]) for _, key, _ in BENCH_COLUMNS])
+    widths = [max(len(r[i]) for r in table) for i in range(len(BENCH_COLUMNS))]
+    for line in table:
+        print("  ".join(cell.rjust(w) if right else cell.ljust(w)
+                        for cell, w, (_, _, right) in zip(line, widths, BENCH_COLUMNS)).rstrip())
+    done = sum(1 for r in rows if r["status"] == "completed")
+    other = ", ".join(sorted({r["status"] for r in rows if r["status"] != "completed"}))
+    print(f"\n{len(rows)} task(s): {done} completed" + (f", {len(rows) - done} not ({other})" if other else ""))
+    print(f"bench log: {path}", file=sys.stderr)
+    return 0 if done == len(rows) else 1
 
 
 def _resume(a: argparse.Namespace) -> int:
@@ -356,18 +441,30 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--deny-shell-pattern", action="append", metavar="REGEX",
                         help="refuse run_shell commands matching this regex. Repeatable.")
 
+    def loop_args(sp) -> None:
+        """The knobs of the loop itself. Shared by run and bench."""
+        sp.add_argument("--step-cap", type=int, default=250)
+        sp.add_argument("--no-todo-gate", action="store_true")
+        sp.add_argument("--result-chars", type=int, default=2000)
+        sp.add_argument("--context-chars", type=int, default=60000)
+        sp.add_argument("--preview-chars", type=int, default=400)
+
     r = sub.add_parser("run", help="run a task")
     r.add_argument("--task")
     r.add_argument("--task-file")
     model_args(r, model_required=True)
     r.add_argument("--run-id", default=None)
-    r.add_argument("--step-cap", type=int, default=250)
-    r.add_argument("--no-todo-gate", action="store_true")
-    r.add_argument("--result-chars", type=int, default=2000)
-    r.add_argument("--context-chars", type=int, default=60000)
-    r.add_argument("--preview-chars", type=int, default=400)
+    loop_args(r)
     prompt_args(r)
     r.set_defaults(fn=_run)
+
+    b = sub.add_parser("bench", help="run a file of tasks back to back and tabulate them")
+    b.add_argument("tasks", metavar="TASKS.jsonl",
+                   help='one task per line: {"task": "...", "workdir": "...", "run_id": "..."}')
+    model_args(b, model_required=True)
+    loop_args(b)
+    prompt_args(b)
+    b.set_defaults(fn=_bench)
 
     rs = sub.add_parser("resume", help="continue an interrupted run (transport_error, step_cap, stalled)")
     rs.add_argument("run_id")
