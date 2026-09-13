@@ -135,7 +135,11 @@ def test_resume_after_a_transport_error(tmp_path):
         {"content": "Closing.", "tool_calls": [todo("completed")]},
         {"content": "Finishing.", "tool_calls": [FINISH]},
     ])
-    res = resume(first.run_dir, registry(), rest)
+    # the two-step API: rebuild the runtime, then drive it
+    rt, detail = prepare(first.run_dir, registry(), rest)
+    assert rt.run_id == "died" and detail == "still down" and rt.state.status == "transport_error"
+    assert rt.config.step_cap == 20 and rt.state.messages[-1]["content"] == "echo some things"
+    res = rt.resume(detail)
     assert res.status == "completed" and res.steps == 3
     recs = read_trajectory(res.run_dir)
     assert [r["type"] for r in recs] == ["header", "footer", "resume", "step", "step", "step", "footer"]
