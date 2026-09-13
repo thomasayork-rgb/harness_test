@@ -247,3 +247,24 @@ def test_toolbelt_list_filter_matches_only_the_line_the_model_sees(tmp_path):
     assert json.loads(steps[0]["result_preview"]) == []   # matched a line the listing never shows
     assert json.loads(steps[1]["result_preview"]) == [
         {"name": "hidden_detail", "description": "Do one visible thing."}]
+
+
+def test_two_calls_of_one_tool_in_a_turn_get_distinct_ids(tmp_path):
+    """`call()` generates ids; two calls of the same tool in one turn must not
+    collide, or the transcript answers one id twice and the provider rejects it."""
+    fake = FakeTransport([
+        {"content": "Listing twice in one turn.",
+         "tool_calls": [call("toolbelt_list", {"filter": "tool_0"}), call("toolbelt_list", {})]},
+        {"content": "Done.", "tool_calls": [todo(("1", "x", "completed")),
+                                            call("final_answer", {"status": "completed", "content": "ok"})]},
+    ])
+    res = AgentRuntime(registry_with(2), fake, tmp_path, "fake", run_id="ids").run("t")
+    assert res.status == "completed" and res.steps == 4
+
+    state = json.loads((res.run_dir / "state.json").read_text())
+    requested = [tc["id"] for m in state["messages"] if m.get("tool_calls") for tc in m["tool_calls"]]
+    answered = [m["tool_call_id"] for m in state["messages"] if m["role"] == "tool"]
+    assert requested == answered and len(requested) == len(set(requested)) == 4
+    # an explicit id is left exactly as given
+    assert call("x", {}, id="mine")["id"] == "mine"
+    assert call("x", {})["id"] != call("x", {})["id"]

@@ -52,7 +52,7 @@ res = rt.run("Find the port")                            # policy=ToolPolicy(...
 steps = [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
 ```
 
-Assert on each step's `tool`, `kind` (`ok | error | denied | final_accepted | final_rejected | text_only`), `result_preview` and artifact file, and on `fake.requests[i]["tools"]` for what was in context on request `i`. A script entry that is an `Exception` instance is raised instead of returned (`TransportError(...)` for a transport failure). Several `tool_calls` in one entry make one turn with several steps; give them explicit ids, since `call()` defaults the id from the tool name.
+Assert on each step's `tool`, `kind` (`ok | error | denied | final_accepted | final_rejected | text_only`), `result_preview` and artifact file, and on `fake.requests[i]["tools"]` for what was in context on request `i`. A script entry that is an `Exception` instance is raised instead of returned (`TransportError(...)` for a transport failure). Several `tool_calls` in one entry make one turn with several steps; `call()` generates a unique id for each, so pass an explicit `id=` only when a test wants to name a call.
 
 ### Real process over HTTP (integration level)
 

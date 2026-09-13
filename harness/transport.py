@@ -18,6 +18,7 @@ Internal message keys starting with ``_`` are stripped before sending.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import urllib.error
 import urllib.request
@@ -116,6 +117,15 @@ class FakeTransport:
         return {"content": item.get("content", ""), "tool_calls": item.get("tool_calls", []), "usage": item.get("usage")}
 
 
+_call_ids = itertools.count(1)
+
+
 def call(name: str, arguments: Any, id: str | None = None) -> dict:
-    """Helper for writing FakeTransport scripts."""
-    return {"id": id or f"call_{name}", "name": name, "arguments": arguments}
+    """Helper for writing FakeTransport scripts.
+
+    A generated id carries a process-wide counter, so two calls of the same
+    tool in one turn are still two distinct ids - a transcript with one id
+    answered twice is malformed, and a provider handed it back would say so.
+    Pass ``id`` when a test wants to name the call itself.
+    """
+    return {"id": id or f"call_{name}_{next(_call_ids)}", "name": name, "arguments": arguments}
