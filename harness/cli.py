@@ -3,7 +3,8 @@
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
                  [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
                  [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
-  harness resume <run_id> [--step-cap N]   (provider flags default to the recording)
+  harness resume <run_id> [--step-cap N] [--progress-nudge N]
+                 (provider, tools, skills and policy flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
   harness skills [--skills DIR] [--workdir d] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
@@ -160,6 +161,7 @@ def _build(a: argparse.Namespace, workdir: Path, run_id: str | None) -> AgentRun
         context_budget_chars=a.context_chars,
         preview_chars=a.preview_chars,
         skill_chars=a.skill_chars,
+        progress_nudge_steps=a.progress_nudge,
     )
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
                       run_id=run_id, policy=policy, prompt_sources=prompt_sources,
@@ -324,7 +326,7 @@ def _resume(a: argparse.Namespace) -> int:
         rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
                                     step_cap=a.step_cap, policy=policy,
                                     invocation=_invocation(a, workdir, extra, skills),
-                                    skills=skills)
+                                    skills=skills, progress_nudge_steps=a.progress_nudge)
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
@@ -498,6 +500,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--preview-chars", type=int, default=400)
         sp.add_argument("--skill-chars", type=int, default=12000,
                         help="refuse to load a skill larger than this (default: 12000)")
+        sp.add_argument("--progress-nudge", type=int, default=12, metavar="N",
+                        help="ask the model to update its plan after N steps with no change "
+                             "to any todo (default: 12; 0 disables)")
 
     r = sub.add_parser("run", help="run a task")
     r.add_argument("--task")
@@ -521,6 +526,9 @@ def build_parser() -> argparse.ArgumentParser:
     model_args(rs, model_required=False, recorded=True)
     rs.add_argument("--step-cap", type=int, default=None,
                     help="raise the cap for the rest of the run (default: the cap it ran under)")
+    rs.add_argument("--progress-nudge", type=int, default=None, metavar="N",
+                    help="steps without a todo change before the model is asked to update its "
+                         "plan (default: what the run recorded; 0 disables)")
     prompt_args(rs)      # accepted so the refusal can explain itself, never applied
     rs.set_defaults(fn=_resume)
 

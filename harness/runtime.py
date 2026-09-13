@@ -17,6 +17,11 @@ Failure semantics (all deliberate, all visible in the trajectory):
   step cap                    → status "step_cap", final null
   policy denies a call        → the denial as the tool result, kind "denied";
                                 loop continues (see harness.policy)
+  plan stops moving           → after progress_nudge_steps steps with no change
+                                to any todo's status or notes, one user message
+                                asking for the plan to be updated, recorded as a
+                                "note" record. Not a step: it does not count
+                                toward the step cap
 
 A run that ended in one of RESUMABLE can be picked up again: rebuild the
 runtime from the persisted state and call ``resume()`` instead of ``run()``.
@@ -33,7 +38,8 @@ from typing import Any
 
 from .context import ContextBudget
 from .plugins import PluginError, load_tools
-from .prompts import BUILTIN, PROVIDED, SYSTEM_PROMPT, TEXT_ONLY_NUDGE, builtin_prompt
+from .prompts import (BUILTIN, PROGRESS_NUDGE, PROVIDED, SYSTEM_PROMPT, TEXT_ONLY_NUDGE,
+                      builtin_prompt)
 from .registry import ToolRegistry, validate_args
 from .skills import SkillSet
 from .todo import NOTES_MAX, apply_update, open_ids, signature, validate_todos
@@ -148,6 +154,7 @@ class RuntimeConfig:
     text_only_limit: int = 3
     transport_retries: int = 1
     skill_chars: int = 12000
+    progress_nudge_steps: int = 12
 
 
 def config_from(stored: dict | None) -> RuntimeConfig:
@@ -430,6 +437,22 @@ class AgentRuntime:
             return describe()
         return None if self.policy is None else repr(self.policy)
 
+    def _nudge_progress(self, idle: int) -> int:
+        """One message when the plan has stopped moving. Returns the counter.
+
+        The gate makes the model write a plan; nothing until now made it keep
+        the plan true. A run can spend forty steps against a list that still
+        says "pending" and nobody, model or reader, can tell what worked.
+        """
+        cfg = self.config
+        st = self.state
+        if not cfg.progress_nudge_steps or not st.todo_initialized or idle < cfg.progress_nudge_steps:
+            return idle
+        text = PROGRESS_NUDGE.format(n=idle)
+        st.messages.append({"role": "user", "content": text})
+        self.writer.note(run_id=self.run_id, step=st.step, kind="progress_nudge", text=text)
+        return 0
+
     def _close_unexecuted(self, calls: list[dict], status: str) -> None:
         """Answer the calls of a turn that was cut short, so the transcript stays well formed."""
         reason = {
@@ -498,6 +521,8 @@ class AgentRuntime:
         cfg = self.config
         st = self.state
         text_only = 0
+        plan = signature(st.todos)      # what the plan looked like when it last moved
+        idle = 0                        # steps since then
         status = "running"
         detail: str | None = None
 
@@ -527,10 +552,12 @@ class AgentRuntime:
                                  tool=None, args=None, result="", artifact=art, tokens_in=tok_in, tokens_out=tok_out,
                                  todo_snapshot=list(st.todos), kind="text_only", call_index=0)
                 st.messages.append({"role": "assistant", "content": reasoning})
+                idle += 1               # no tool ran, so the plan cannot have moved
                 if text_only >= cfg.text_only_limit:
                     status, detail = "stalled", f"{text_only} consecutive turns without a tool call"
                     break
                 st.messages.append({"role": "user", "content": TEXT_ONLY_NUDGE})
+                idle = self._nudge_progress(idle)
                 st.save(self.state_path)
                 continue
 
@@ -571,15 +598,20 @@ class AgentRuntime:
                 message.update(extra)
                 st.messages.append(message)
                 executed += 1
+                moved = signature(st.todos)
+                plan, idle = (moved, 0) if moved != plan else (plan, idle + 1)
                 if kind == "final_accepted":
                     status = st.final["status"]  # type: ignore[index]
                     break
 
             self._close_unexecuted(calls[executed:], status)
             self.budget.enforce(st.messages)
+            if status == "running":
+                idle = self._nudge_progress(idle)
             st.save(self.state_path)
 
         st.status = status
         st.save(self.state_path)
-        self.writer.footer(run_id=self.run_id, status=status, steps=st.step, final=st.final, detail=detail)
+        self.writer.footer(run_id=self.run_id, status=status, steps=st.step, final=st.final,
+                           detail=detail, todos=list(st.todos))
         return RunResult(run_id=self.run_id, status=status, steps=st.step, final=st.final, run_dir=self.run_dir)

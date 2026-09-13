@@ -64,6 +64,15 @@ SKILLS_ANCHOR = "PLAN. Call todo_write"
 
 TEXT_ONLY_NUDGE = "Use a tool. If the work is done, close your todos and call final_answer."
 
+# Appended by the loop when a plan stops moving (RuntimeConfig.progress_nudge_steps).
+# A run that quietly stopped tracking what it is doing is the failure mode this
+# is for: the steps keep coming and nothing says whether any of them worked.
+PROGRESS_NUDGE = (
+    "{n} steps since your todo list last changed. Update it now: mark what is done, with a note "
+    "recording the outcome; mark what you are working on in_progress; add what the task turned out "
+    "to need and cancel what it did not. If the plan is right and the work is done, close the todos "
+    "and call final_answer.")
+
 # Where a global prompt may live, in the order they are tried.
 GLOBAL_ENV = "HARNESS_SYSTEM_PROMPT"
 GLOBAL_XDG_ENV = "XDG_CONFIG_HOME"

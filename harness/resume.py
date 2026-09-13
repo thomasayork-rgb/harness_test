@@ -72,6 +72,7 @@ def prepare(
     policy: Any = None,
     invocation: dict | None = None,
     skills: Any = None,
+    progress_nudge_steps: int | None = None,
 ) -> tuple[AgentRuntime, str | None]:
     """Rebuild the runtime for a resumable run. Returns it with the detail of
     the footer that closed the previous segment, for ``AgentRuntime.resume``.
@@ -89,6 +90,8 @@ def prepare(
     config = effective_config(records)
     if step_cap is not None:
         config.step_cap = step_cap
+    if progress_nudge_steps is not None:
+        config.progress_nudge_steps = progress_nudge_steps
     runtime = AgentRuntime(registry, transport, path.parent, model or state.model, config,
                            run_id=path.name, state=state, policy=policy,
                            invocation=invocation or recorded_invocation(records),
@@ -106,8 +109,10 @@ def resume(
     policy: Any = None,
     invocation: dict | None = None,
     skills: Any = None,
+    progress_nudge_steps: int | None = None,
 ) -> RunResult:
     """Continue a run in place. The trajectory grows; it is not replaced."""
     runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap,
-                              policy=policy, invocation=invocation, skills=skills)
+                              policy=policy, invocation=invocation, skills=skills,
+                              progress_nudge_steps=progress_nudge_steps)
     return runtime.resume(detail)
