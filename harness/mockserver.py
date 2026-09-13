@@ -1,4 +1,4 @@
-"""A scripted OpenAI-compatible server, stdlib only.
+"""Scripted model servers, stdlib only: OpenAI-compatible and Messages API.
 
 ``FakeTransport`` stops at the runtime boundary; this one exercises everything
 below it — HTTP, headers, wire format, JSON-encoded tool arguments, error
@@ -22,6 +22,11 @@ Script entries, tried in this order:
 
 An exhausted script answers 503, which the transport reports as a
 ``TransportError`` rather than hanging.
+
+``MockAnthropicServer`` is the same machinery pointed at ``/v1/messages``:
+``x-api-key`` instead of a bearer token, and scripted responses rendered as
+Messages API content blocks. Give a script entry a ``thinking`` key and the
+response carries a thinking block, which the harness must drop on the floor.
 """
 from __future__ import annotations
 
@@ -32,6 +37,33 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 CHAT_PATH = "/chat/completions"
+MESSAGES_PATH = "/messages"
+
+
+class Headers(dict):
+    """Request headers exactly as received, looked up case-insensitively.
+
+    urllib spells ``x-api-key`` as ``X-api-key`` on the wire; HTTP says that is
+    the same header, so a test asserting on one should not depend on which.
+    """
+
+    def __init__(self, items) -> None:
+        super().__init__(items)
+        self._lower = {k.lower(): v for k, v in self.items()}
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return self._lower[str(key).lower()]
+
+    def __contains__(self, key) -> bool:
+        return dict.__contains__(self, key) or str(key).lower() in self._lower
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
 
 
 class HttpError:
@@ -78,10 +110,44 @@ def chat_completion_payload(resp: dict, model: str, index: int = 0) -> dict:
     return payload
 
 
+def messages_payload(resp: dict, model: str, index: int = 0) -> dict:
+    """Turn a FakeTransport-shaped response into a Messages API wire payload."""
+    blocks: list[dict] = []
+    # A private reasoning channel, as the real API emits when thinking is on.
+    # The harness must never read it; it is here so tests can prove that.
+    if resp.get("thinking"):
+        blocks.append({"type": "thinking", "thinking": resp["thinking"], "signature": "sig-mock"})
+    if resp.get("content"):
+        blocks.append({"type": "text", "text": resp["content"]})
+    for i, c in enumerate(resp.get("tool_calls") or []):
+        args = c.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"raw": args}
+        blocks.append({"type": "tool_use", "id": c.get("id") or f"toolu_{index}_{i}",
+                       "name": c.get("name", ""), "input": args})
+    usage = resp.get("usage") or {}
+    return {
+        "id": f"msg_mock_{index}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": blocks,
+        "stop_reason": "tool_use" if any(b["type"] == "tool_use" for b in blocks) else "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("prompt_tokens") or 0,
+                  "output_tokens": usage.get("completion_tokens") or 0,
+                  "cache_creation_input_tokens": 0,
+                  "cache_read_input_tokens": 0},
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def __init__(self, *args, mock: "MockOpenAIServer", **kwargs) -> None:
+    def __init__(self, *args, mock: "_MockServer", **kwargs) -> None:
         self.mock = mock
         super().__init__(*args, **kwargs)
 
@@ -104,13 +170,13 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {"_unparseable": raw}
 
-        if not self.path.endswith(CHAT_PATH):
+        if not self.path.endswith(self.mock.path_suffix):
             self._send(404, {"error": {"message": f"no such path: {self.path}"}})
             return
 
-        auth = self.headers.get("Authorization")
-        self.mock.record(self.path, body, dict(self.headers))
-        if self.mock.api_key and auth != f"Bearer {self.mock.api_key}":
+        headers = Headers(self.headers.items())
+        self.mock.record(self.path, body, headers)
+        if not self.mock.authorized(headers):
             self._send(401, {"error": {"message": "invalid api key"}})
             return
 
@@ -124,13 +190,17 @@ class _Handler(BaseHTTPRequestHandler):
         if callable(entry):
             self._send(200, entry(body))
             return
-        if isinstance(entry, dict) and "choices" in entry:
+        if isinstance(entry, dict) and self.mock.is_raw(entry):
             self._send(200, entry)
             return
-        self._send(200, chat_completion_payload(entry, body.get("model") or self.mock.model, index))
+        self._send(200, self.mock.wire_payload(entry, body.get("model") or self.mock.model, index))
 
 
-class MockOpenAIServer:
+class _MockServer:
+    """Lifecycle and scripting; the subclass supplies the provider's dialect."""
+
+    path_suffix = ""
+
     def __init__(self, script: list, model: str = "mock-model", api_key: str | None = None,
                  host: str = "127.0.0.1") -> None:
         self.script = list(script)
@@ -164,7 +234,7 @@ class MockOpenAIServer:
             self._thread.join(timeout=5)
             self._thread = None
 
-    def __enter__(self) -> "MockOpenAIServer":
+    def __enter__(self) -> "_MockServer":
         self.start()
         return self
 
@@ -200,3 +270,44 @@ class MockOpenAIServer:
     def served(self) -> int:
         with self._lock:
             return self._index
+
+    # ---- the provider's dialect --------------------------------------------
+
+    def authorized(self, headers) -> bool:
+        raise NotImplementedError
+
+    def is_raw(self, entry: dict) -> bool:
+        raise NotImplementedError
+
+    def wire_payload(self, entry: dict, model: str, index: int) -> dict:
+        raise NotImplementedError
+
+
+class MockOpenAIServer(_MockServer):
+    """Scripted ``/v1/chat/completions``."""
+
+    path_suffix = CHAT_PATH
+
+    def authorized(self, headers) -> bool:
+        return not self.api_key or headers.get("Authorization") == f"Bearer {self.api_key}"
+
+    def is_raw(self, entry: dict) -> bool:
+        return "choices" in entry
+
+    def wire_payload(self, entry: dict, model: str, index: int) -> dict:
+        return chat_completion_payload(entry, model, index)
+
+
+class MockAnthropicServer(_MockServer):
+    """Scripted ``/v1/messages``: x-api-key, anthropic-version, content blocks."""
+
+    path_suffix = MESSAGES_PATH
+
+    def authorized(self, headers) -> bool:
+        return not self.api_key or headers.get("x-api-key") == self.api_key
+
+    def is_raw(self, entry: dict) -> bool:
+        return entry.get("type") == "message"
+
+    def wire_payload(self, entry: dict, model: str, index: int) -> dict:
+        return messages_payload(entry, model, index)

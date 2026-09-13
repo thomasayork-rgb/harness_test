@@ -1,6 +1,7 @@
 """CLI.
 
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
+                 [--provider openai|anthropic]
   harness resume <run_id> --endpoint http://host:port/v1 [--step-cap N]
   harness tools  [--tools mod] [--filter kw]
   harness trace  <run_id> [--step N | --summary]
@@ -19,6 +20,7 @@ import os
 import sys
 from pathlib import Path
 
+from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
 from .plugins import PluginError, load_all
 from .registry import ToolRegistry
 from .replay import compare
@@ -53,13 +55,13 @@ def _extra_body(raw: str | None) -> dict:
 
 def _transport(a: argparse.Namespace) -> Transport:
     """The provider adapter a run or resume will talk to. Raises ValueError on
-    a bad --extra-body."""
-    return ChatCompletionsTransport(
-        endpoint=a.endpoint,
-        api_key=a.api_key or os.environ.get("HARNESS_API_KEY"),
-        timeout=a.timeout,
-        extra=_extra_body(a.extra_body),
-    )
+    a bad --extra-body or an option the provider refuses."""
+    extra = _extra_body(a.extra_body)
+    key = a.api_key or os.environ.get("HARNESS_API_KEY")
+    if a.provider == "anthropic":
+        return AnthropicMessagesTransport(endpoint=a.endpoint, api_key=key, timeout=a.timeout,
+                                          extra=extra, max_tokens=a.max_tokens)
+    return ChatCompletionsTransport(endpoint=a.endpoint, api_key=key, timeout=a.timeout, extra=extra)
 
 
 def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
@@ -205,8 +207,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--model", required=model_required, default=None,
                         help="model id" + ("" if model_required else " (default: the one the run recorded)"))
         sp.add_argument("--endpoint", required=True,
-                        help="OpenAI-compatible base URL, e.g. http://localhost:8080/v1")
+                        help="provider base URL, e.g. http://localhost:8080/v1 or "
+                             "https://api.anthropic.com/v1")
+        sp.add_argument("--provider", choices=("openai", "anthropic"), default="openai",
+                        help="wire format: OpenAI-compatible /chat/completions (default) "
+                             "or the Anthropic Messages API")
         sp.add_argument("--api-key", default=None, help="or set HARNESS_API_KEY")
+        sp.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                        help=f"response cap, anthropic provider only (default: {DEFAULT_MAX_TOKENS})")
         sp.add_argument("--timeout", type=float, default=120.0)
         sp.add_argument("--extra-body", default=None, metavar="JSON",
                         help='extra provider request parameters, e.g. \'{"temperature": 0}\'')
