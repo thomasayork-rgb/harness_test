@@ -1,0 +1,321 @@
+"""Skills: markdown guides the agent discovers and loads on demand.
+
+A skill teaches the model how to do one kind of work. It is discovered lazily,
+in the same spirit as the toolbelt: only names and one-line descriptions are
+held until the model calls ``skill_load``, and only then does the text enter
+the conversation.
+
+Format - ``skills/<name>/SKILL.md`` or ``skills/<name>.md``::
+
+    ---
+    name: code-change            # optional; defaults to the directory or file stem
+    description: Change code in this project safely.
+    tools: [fs_search, fs_read]  # optional; activated when the skill is loaded
+    plugin: ./tools.py           # optional; a --tools module, relative to this file
+    ---
+    The body is the skill: whatever the model should read before doing the work.
+
+The frontmatter is parsed here, not by a YAML library: ``key: value`` scalars,
+``[a, b]`` inline lists, ``- item`` block lists, and indented continuation
+lines for a multi-line value. Anything else in the block is an error naming the
+line, because a skill the author thought they wrote is worse than none.
+
+Discovery merges every location that exists, lowest precedence first::
+
+    $XDG_CONFIG_HOME/harness/skills  (else ~/.config/harness/skills)
+    $HARNESS_SKILLS                  (os.pathsep-separated)
+    <workdir>/.harness/skills        (skills that live with a project)
+    --skills DIR                     (repeatable; a later one wins)
+
+A name found twice is a clash: the last directory wins and the clash is
+reported, once, rather than silently deciding. A top-level ``.md`` file with no
+frontmatter is not a skill and is skipped in silence; one that has frontmatter
+but no description is an error, reported the same way.
+"""
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+
+SKILL_FILE = "SKILL.md"
+SKILLS_ENV = "HARNESS_SKILLS"
+XDG_ENV = "XDG_CONFIG_HOME"
+CONFIG_RELATIVE = Path("harness") / "skills"
+PROJECT_RELATIVE = Path(".harness") / "skills"
+FENCE = "---"
+
+_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s*(.*)$")
+_ITEM = re.compile(r"^-\s+(.*)$")
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+class SkillError(Exception):
+    """A skill file that cannot be used, with the reason to report."""
+
+
+class NoFrontmatter(SkillError):
+    """No ``---`` block at all: a markdown file that was never a skill."""
+
+
+def _scalar(raw: str) -> str:
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
+
+
+def _inline_list(raw: str) -> list[str] | None:
+    text = raw.strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return None
+    inner = text[1:-1].strip()
+    return [_scalar(part) for part in inner.split(",") if part.strip()] if inner else []
+
+
+def parse_frontmatter(text: str) -> tuple[dict, str]:
+    """``(metadata, body)`` for a skill file. Raises SkillError on a block this
+    parser cannot read, NoFrontmatter when there is no block at all."""
+    lines = text.lstrip("\ufeff").splitlines()
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i >= len(lines) or lines[i].strip() != FENCE:
+        raise NoFrontmatter(f"no '{FENCE}' frontmatter block")
+    i += 1
+
+    meta: dict[str, Any] = {}
+    key: str | None = None
+    closed = False
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.strip() == FENCE:
+            closed = True
+            break
+        if not line.strip():
+            continue
+        item = _ITEM.match(line.strip())
+        if item and key is not None and isinstance(meta.get(key), list):
+            meta[key].append(_scalar(item.group(1)))
+            continue
+        if line[:1].isspace() and key is not None and isinstance(meta.get(key), str):
+            meta[key] = (meta[key] + "\n" + line.strip()).strip()
+            continue
+        found = _KEY.match(line.strip())
+        if not found:
+            raise SkillError(f"line {i}: not a 'key: value' frontmatter line: {line.strip()[:60]!r}")
+        key, raw = found.group(1), found.group(2).strip()
+        if not raw:
+            meta[key] = []            # a '- item' block may follow
+        else:
+            inline = _inline_list(raw)
+            meta[key] = inline if inline is not None else _scalar(raw)
+    if not closed:
+        raise SkillError(f"frontmatter block is not closed with '{FENCE}'")
+    return meta, "\n".join(lines[i:]).strip()
+
+
+def _string_list(value: Any, what: str) -> list[str]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return list(value)
+    raise SkillError(f"{what} must be a list of names")
+
+
+@dataclass
+class Skill:
+    """One loaded skill file. ``body`` is what the model reads."""
+
+    name: str
+    description: str
+    body: str
+    path: Path
+    source: Path                                  # the skills directory it came from
+    tools: list[str] = field(default_factory=list)
+    plugin: str | None = None
+
+    @property
+    def chars(self) -> int:
+        return len(self.body)
+
+    @property
+    def plugin_path(self) -> Path | None:
+        """The ``--tools`` module this skill registers, resolved against itself."""
+        return (self.path.parent / self.plugin).resolve() if self.plugin else None
+
+    def summary(self) -> str:
+        """The description's first line: all the model sees before loading."""
+        first = self.description.strip().splitlines()[0] if self.description.strip() else ""
+        return first[:160]
+
+    def brief(self) -> dict:
+        return {"name": self.name, "description": self.summary()}
+
+    def matches(self, needle: str) -> bool:
+        return needle in self.name.lower() or needle in self.summary().lower()
+
+
+def load_skill(path: Any, source: Any = None) -> Skill:
+    """Read one skill file. Raises SkillError naming the file."""
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise SkillError(f"{path}: cannot read skill: {e.strerror or e}") from None
+    try:
+        meta, body = parse_frontmatter(text)
+    except NoFrontmatter as e:
+        raise NoFrontmatter(f"{path}: {e}") from None
+    except SkillError as e:
+        raise SkillError(f"{path}: {e}") from None
+
+    stem = path.parent.name if path.name == SKILL_FILE else path.stem
+    name = meta.get("name") or stem
+    if not isinstance(name, str) or not _NAME.match(name):
+        raise SkillError(f"{path}: bad skill name {name!r}")
+    description = meta.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise SkillError(f"{path}: a skill needs a 'description' in its frontmatter")
+    plugin = meta.get("plugin")
+    if plugin is not None and not isinstance(plugin, str):
+        raise SkillError(f"{path}: 'plugin' must be a path relative to the skill file")
+    try:
+        tools = _string_list(meta.get("tools"), "'tools'")
+    except SkillError as e:
+        raise SkillError(f"{path}: {e}") from None
+    return Skill(name=name, description=description.strip(), body=body, path=path,
+                 source=Path(source) if source is not None else path.parent,
+                 tools=tools, plugin=plugin or None)
+
+
+@dataclass
+class SkillSet:
+    """What one run discovered: the directories searched and the skills in them."""
+
+    dirs: list[Path] = field(default_factory=list)
+    skills: dict[str, Skill] = field(default_factory=dict)
+    clashes: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    workdir: Path | None = None
+
+    def __len__(self) -> int:
+        return len(self.skills)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self.skills
+
+    def get(self, name: str) -> Skill | None:
+        return self.skills.get(name)
+
+    def names(self) -> list[str]:
+        return list(self.skills)
+
+    def list(self, filter: str | None = None) -> list[dict]:
+        """Name + first description line per skill, filtered on exactly that text."""
+        needle = (filter or "").strip().lower()
+        return [s.brief() for s in self.skills.values() if not needle or s.matches(needle)]
+
+    def warnings(self) -> list[str]:
+        """Everything discovery wants to say out loud, once."""
+        return list(self.errors) + list(self.clashes)
+
+    def describe(self) -> dict:
+        """What the trajectory header records about discovery."""
+        return {"dirs": [str(d) for d in self.dirs], "names": self.names()}
+
+
+def _candidates(directory: Path) -> list[tuple[Path, bool]]:
+    """``(path, required)`` per skill file in a directory. ``required`` marks a
+    ``<name>/SKILL.md``: a directory laid out as a skill that fails to parse is
+    a mistake worth reporting, a stray ``notes.md`` is not."""
+    out: list[tuple[Path, bool]] = []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if entry.is_dir():
+            nested = entry / SKILL_FILE
+            if nested.is_file():
+                out.append((nested, True))
+        elif entry.is_file() and entry.suffix == ".md":
+            out.append((entry, False))
+    return out
+
+
+def discover(dirs: Iterable[Any], workdir: Any = None) -> SkillSet:
+    """Every skill in ``dirs``, lowest precedence first: a later directory wins
+    a name clash, and the clash is recorded rather than hidden."""
+    searched: list[Path] = []
+    skills: dict[str, Skill] = {}
+    clashes: list[str] = []
+    errors: list[str] = []
+    for raw in dirs:
+        directory = Path(raw)
+        if not directory.is_dir():
+            continue
+        searched.append(directory)
+        for path, required in _candidates(directory):
+            try:
+                skill = load_skill(path, directory)
+            except NoFrontmatter as e:
+                if required:
+                    errors.append(str(e))
+                continue
+            except SkillError as e:
+                errors.append(str(e))
+                continue
+            previous = skills.get(skill.name)
+            if previous is not None:
+                clashes.append(f"skill '{skill.name}': using {skill.path}, shadowing {previous.path}")
+            skills[skill.name] = skill
+    ordered = {name: skills[name] for name in sorted(skills)}
+    return SkillSet(dirs=searched, skills=ordered, clashes=clashes, errors=errors,
+                    workdir=Path(workdir) if workdir is not None else None)
+
+
+def config_dir(env: Mapping[str, str] | None = None) -> Path:
+    """``$XDG_CONFIG_HOME/harness/skills``, else ``~/.config/harness/skills``."""
+    env = os.environ if env is None else env
+    xdg = env.get(XDG_ENV)
+    if xdg:
+        return Path(xdg).expanduser() / CONFIG_RELATIVE
+    home = env.get("HOME")
+    base = Path(home).expanduser() if home else Path.home()
+    return base / ".config" / CONFIG_RELATIVE
+
+
+def search_dirs(flags: Iterable[Any] = (), workdir: Any = None,
+                env: Mapping[str, str] | None = None) -> list[Path]:
+    """Every skills directory that exists, lowest precedence first.
+
+    config < ``$HARNESS_SKILLS`` < ``<workdir>/.harness/skills`` < ``--skills``:
+    the more specific the location, the later it is searched, and the later a
+    directory is searched the more it wins.
+    """
+    env = os.environ if env is None else env
+    candidates: list[Path] = [config_dir(env)]
+    for part in (env.get(SKILLS_ENV) or "").split(os.pathsep):
+        if part.strip():
+            candidates.append(Path(part.strip()).expanduser())
+    if workdir is not None:
+        candidates.append(Path(workdir) / PROJECT_RELATIVE)
+    candidates.extend(Path(f).expanduser() for f in flags or ())
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        if not path.is_dir():
+            continue
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
