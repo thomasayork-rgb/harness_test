@@ -53,6 +53,15 @@ FILES AND SHELL, where those tools exist.
 
 FINISH with final_answer(status, content). content is the deliverable, written for someone who did not watch the run: the answer, the evidence for it (paths, values, commands), and anything you could not do. status is completed when the task is done, blocked when something outside your control stopped you, failed when you could not do it. Say which, and why. Never fabricate a result or claim work you did not do."""
 
+SKILLS_SECTION = """SKILLS. Written guides for kinds of work this harness knows. Call skill_list before planning anything non-trivial, and load the ones that match.
+- skill_list(filter): names and one line each.
+- skill_load(name): the whole guide as the result, with the tools it needs activated. Follow it.
+- skill_unload(name): drop a guide you are done with; its text leaves your context."""
+
+# The SKILLS section is spliced in before the plan: a skill that matches should
+# shape the plan, not be discovered halfway through executing one.
+SKILLS_ANCHOR = "PLAN. Call todo_write"
+
 TEXT_ONLY_NUDGE = "Use a tool. If the work is done, close your todos and call final_answer."
 
 # Where a global prompt may live, in the order they are tried.
@@ -67,6 +76,19 @@ PROVIDED = "(provided)"
 class PromptError(Exception):
     """A prompt file that was named but cannot be read. The CLI turns this
     into a usage error."""
+
+
+def builtin_prompt(skills: bool = False) -> str:
+    """The built-in base prompt. The SKILLS section is included only for a run
+    that discovered skills: a prompt that names a tool the run does not have is
+    worse than one that stays quiet."""
+    base = SYSTEM_PROMPT.strip()
+    if not skills:
+        return base
+    section = SKILLS_SECTION.strip()
+    if SKILLS_ANCHOR in base:
+        return base.replace(SKILLS_ANCHOR, f"{section}\n\n{SKILLS_ANCHOR}", 1)
+    return f"{base}\n\n{section}"
 
 
 def global_prompt_candidates(env: Mapping[str, str] | None = None) -> list[Path]:
@@ -111,19 +133,21 @@ def resolve_system_prompt(
     *,
     use_global: bool = True,
     env: Mapping[str, str] | None = None,
+    skills: bool = False,
 ) -> tuple[str, list[dict]]:
     """``(prompt, sources)`` for the given flags.
 
     ``base`` is a path replacing the built-in prompt entirely; ``appends`` are
-    paths added after the global prompt, in order. A file that cannot be read
-    raises ``PromptError`` - a prompt the user asked for and did not get is
-    never worth continuing past.
+    paths added after the global prompt, in order. ``skills`` adds the SKILLS
+    section to the built-in prompt, and only to it: a prompt the user supplied
+    is theirs. A file that cannot be read raises ``PromptError`` - a prompt the
+    user asked for and did not get is never worth continuing past.
     """
     segments: list[str] = []
     sources: list[dict] = []
 
     if base is None:
-        text = SYSTEM_PROMPT.strip()
+        text = builtin_prompt(skills)
         sources.append(_layer(BUILTIN, "base", text))
     else:
         text = _read(base).strip()

@@ -32,8 +32,10 @@ from pathlib import Path
 from typing import Any
 
 from .context import ContextBudget
-from .prompts import BUILTIN, PROVIDED, SYSTEM_PROMPT, TEXT_ONLY_NUDGE
+from .plugins import PluginError, load_tools
+from .prompts import BUILTIN, PROVIDED, SYSTEM_PROMPT, TEXT_ONLY_NUDGE, builtin_prompt
 from .registry import ToolRegistry, validate_args
+from .skills import SkillSet
 from .todo import apply_update, open_ids, validate_todos
 from .trajectory import TrajectoryWriter
 from .transport import Transport, TransportError
@@ -81,6 +83,29 @@ META_TOOLS: list[dict] = [
 ]
 META_NAMES = {t["function"]["name"] for t in META_TOOLS}
 
+# The skill meta-tools exist only for a run that discovered skills: a run
+# without them starts with exactly the six above, and nothing in context
+# mentions a lever that is not there.
+SKILL_META_TOOLS: list[dict] = [
+    {"type": "function", "function": {
+        "name": "skill_list",
+        "description": "List available skills: name and one-line description. Optional keyword filter, matched against the name and that one line.",
+        "parameters": {"type": "object", "properties": {"filter": {"type": "string"}}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "skill_load",
+        "description": "Load a skill: its full text becomes this result, and the tools it declares are activated.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+    {"type": "function", "function": {
+        "name": "skill_unload",
+        "description": "Drop a loaded skill's text from context when you are done with it. The tools it activated stay active.",
+        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+    }},
+]
+SKILL_META_NAMES = {t["function"]["name"] for t in SKILL_META_TOOLS}
+ALL_META_NAMES = META_NAMES | SKILL_META_NAMES
+
 # Statuses a run can be picked up from. completed/blocked/failed are answers,
 # not interruptions, and "running" means some other process still owns the run.
 RESUMABLE = ("transport_error", "step_cap", "stalled")
@@ -99,7 +124,13 @@ NOT_EXECUTED = "error: not executed: {reason}"
 # A denied call is not an error: the tool did not fail, it never ran. Its own
 # kind keeps the two apart in a trace and in trace --summary.
 DENIAL = "denied: {reason}"
-_META_PARAMS = {t["function"]["name"]: t["function"]["parameters"] for t in META_TOOLS}
+_META_PARAMS = {t["function"]["name"]: t["function"]["parameters"]
+                for t in META_TOOLS + SKILL_META_TOOLS}
+
+# A loaded skill's text is the one tool result that is neither truncated nor
+# evicted: the model was told to follow it, so it has to still be there.
+SKILL_LOADED = "skill '{name}' loaded ({chars} chars). {tools}"
+SKILL_UNLOADED = "[skill '{name}' unloaded; its text is out of context. skill_load reads it again.]"
 
 
 class ResumeError(Exception):
@@ -115,6 +146,7 @@ class RuntimeConfig:
     preview_chars: int = 400
     text_only_limit: int = 3
     transport_retries: int = 1
+    skill_chars: int = 12000
 
 
 def config_from(stored: dict | None) -> RuntimeConfig:
@@ -142,6 +174,7 @@ class RunState:
     step: int = 0
     step_cap: int = 250
     active_tools: list[str] = field(default_factory=list)
+    loaded_skills: list[str] = field(default_factory=list)
     todo_initialized: bool = False
     todos: list[dict] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
@@ -192,12 +225,16 @@ class AgentRuntime:
         policy: Any = None,
         prompt_sources: list[dict] | None = None,
         invocation: dict | None = None,
+        skills: SkillSet | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
         self.model = model
         self.config = config or RuntimeConfig()
-        self.system_prompt = system_prompt or SYSTEM_PROMPT
+        # what discovery found, if anything: names and descriptions only until
+        # the model calls skill_load (see harness.skills)
+        self.skills = skills if skills is not None else SkillSet()
+        self.system_prompt = system_prompt or builtin_prompt(bool(self.skills))
         # how this run was launched: endpoint, provider, workdir, tool modules.
         # Recorded so `resume` can default to it; never holds the API key.
         self.invocation = dict(invocation or {})
@@ -215,6 +252,9 @@ class AgentRuntime:
         self.writer = TrajectoryWriter(self.run_dir, preview_chars=self.config.preview_chars)
         self.state = state or RunState(run_id=self.run_id, model=model, step_cap=self.config.step_cap)
         self.state.step_cap = self.config.step_cap
+        # extra keys for the tool message of the call being dispatched, set by a
+        # meta-tool that needs one (skill_load protects and un-truncates its own)
+        self._annotate: dict = {}
 
     # ---- request assembly -------------------------------------------------
 
@@ -224,7 +264,8 @@ class AgentRuntime:
             spec = self.registry.get(name)
             if spec:
                 active.append(spec.schema())
-        return META_TOOLS + active
+        meta = META_TOOLS + SKILL_META_TOOLS if self.skills else META_TOOLS
+        return meta + active
 
     def _complete(self, messages: list[dict]) -> dict:
         last: Exception | None = None
@@ -246,7 +287,7 @@ class AgentRuntime:
                 return f"error: policy raised {type(e).__name__}: {e}", "error"
             if verdict:
                 return DENIAL.format(reason=verdict), "denied"
-        if name in META_NAMES:
+        if name in META_NAMES or (self.skills and name in SKILL_META_NAMES):
             err = validate_args(_META_PARAMS[name], args)
             if err:
                 return f"error: {err}", "error"
@@ -292,6 +333,76 @@ class AgentRuntime:
         removed = [n for n in args["names"] if n in self.state.active_tools]
         self.state.active_tools = [n for n in self.state.active_tools if n not in removed]
         return _to_text({"removed": removed, "active": list(self.state.active_tools)}), "ok"
+
+    def _meta_skill_list(self, args: dict) -> tuple[str, str]:
+        return _to_text(self.skills.list(args.get("filter"))), "ok"
+
+    def _meta_skill_load(self, args: dict) -> tuple[str, str]:
+        """The skill's text as the tool result, plus the tools it declares.
+
+        Nothing is half-done: an oversized skill or a plugin that will not load
+        leaves no tools activated and nothing marked loaded, so the model can
+        pick another route with an accurate picture of its context.
+        """
+        name = args["name"]
+        skill = self.skills.get(name)
+        if skill is None:
+            known = ", ".join(self.skills.names()) or "(none)"
+            return f"error: unknown skill '{name}'. Available: {known}", "error"
+        if name in self.state.loaded_skills:
+            return f"skill '{name}' is already loaded; its text is above in this conversation.", "ok"
+        if skill.chars > self.config.skill_chars:
+            return (f"error: skill '{name}' is {skill.chars} chars, over the {self.config.skill_chars} "
+                    "char limit for one skill (--skill-chars). It was not loaded."), "error"
+
+        if skill.plugin_path is not None:
+            try:
+                added = load_tools(self.registry, str(skill.plugin_path), self.skills.workdir or Path("."))
+            except PluginError as e:
+                return f"error: skill '{name}' declares a plugin that will not load: {e}", "error"
+            plugin_note = f"plugin: registered {', '.join(added) or 'nothing'}. "
+        else:
+            plugin_note = ""
+
+        activated, already, unknown = [], [], []
+        for tool in skill.tools:
+            if tool not in self.registry:
+                unknown.append(tool)
+            elif tool in self.state.active_tools:
+                already.append(tool)
+            else:
+                self.state.active_tools.append(tool)
+                activated.append(tool)
+        parts = []
+        if activated:
+            parts.append("activated " + ", ".join(activated))
+        if already:
+            parts.append("already active: " + ", ".join(already))
+        if unknown:
+            parts.append("declared but unknown: " + ", ".join(unknown))
+        tools_note = ("tools: " + "; ".join(parts) + "." if parts else "No tools declared.")
+
+        self.state.loaded_skills.append(name)
+        self._annotate = {"_protected": True, "_skill": name, "_full": True}
+        header = SKILL_LOADED.format(name=name, chars=skill.chars, tools=plugin_note + tools_note)
+        return f"{header}\n\n{skill.body}", "ok"
+
+    def _meta_skill_unload(self, args: dict) -> tuple[str, str]:
+        name = args["name"]
+        if name not in self.state.loaded_skills:
+            loaded = ", ".join(self.state.loaded_skills) or "(none)"
+            return f"error: skill '{name}' is not loaded. Loaded: {loaded}", "error"
+        marker = SKILL_UNLOADED.format(name=name)
+        freed = 0
+        for m in self.state.messages:
+            if m.get("_skill") == name:
+                freed += max(0, len(m.get("content") or "") - len(marker))
+                m["content"] = marker
+                m["_protected"] = False
+                m["_skill"] = None
+        self.state.loaded_skills.remove(name)
+        return _to_text({"unloaded": name, "context_freed_chars": freed,
+                         "loaded": list(self.state.loaded_skills)}), "ok"
 
     def _meta_todo_write(self, args: dict) -> tuple[str, str]:
         err = validate_todos(args["todos"])
@@ -344,7 +455,8 @@ class AgentRuntime:
         self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task,
                            config=asdict(cfg), policy=self._policy_description(),
                            prompt_sources=list(self.prompt_sources),
-                           invocation=dict(self.invocation))
+                           invocation=dict(self.invocation),
+                           skills=self.skills.describe())
         st.save(self.state_path)
         return self._loop()
 
@@ -439,6 +551,7 @@ class AgentRuntime:
                     break
                 st.step += 1
                 t1 = time.monotonic()
+                self._annotate = {}
                 result, kind = self._dispatch(c["name"], c["arguments"])
                 dispatch_ms = int((time.monotonic() - t1) * 1000)
                 art = self.writer.write_artifact(st.step, c["name"], result)
@@ -446,11 +559,16 @@ class AgentRuntime:
                                  reasoning=reasoning if first else "", tool=c["name"], args=c["arguments"], result=result,
                                  artifact=art, tokens_in=tok_in if first else None, tokens_out=tok_out if first else None,
                                  todo_snapshot=list(st.todos), kind=kind, call_index=index)
-                st.messages.append({
+                extra = dict(self._annotate)
+                whole = extra.pop("_full", False)
+                message = {
                     "role": "tool", "tool_call_id": c["id"],
-                    "content": self.budget.truncate_result(result, art),
-                    "_artifact": art, "_protected": c["name"] == "todo_write",
-                })
+                    "content": result if whole else self.budget.truncate_result(result, art),
+                    "_artifact": art,
+                    "_protected": c["name"] == "todo_write" or bool(extra.get("_protected")),
+                }
+                message.update(extra)
+                st.messages.append(message)
                 executed += 1
                 if kind == "final_accepted":
                     status = st.final["status"]  # type: ignore[index]

@@ -63,7 +63,7 @@ class TrajectoryWriter:
 
     def header(self, *, run_id: str, model: str, step_cap: int, task: str, config: dict,
                policy: Any = None, prompt_sources: list[dict] | None = None,
-               invocation: dict | None = None) -> None:
+               invocation: dict | None = None, skills: dict | None = None) -> None:
         self._write({
             "type": "header",
             "run_id": run_id,
@@ -76,6 +76,7 @@ class TrajectoryWriter:
             "policy": policy,
             "prompt_sources": prompt_sources or [],
             "invocation": invocation or {},
+            "skills": skills or {"dirs": [], "names": []},
         })
 
     def write_artifact(self, step: int, tool: str | None, text: str) -> str:
@@ -217,6 +218,19 @@ def _wall_seconds(records: list[dict]) -> float | None:
     return round(total, 1) if seen else None
 
 
+def skills_loaded(records: list[dict]) -> list[str]:
+    """The skills the run actually read, in the order it first read them."""
+    out: list[str] = []
+    for rec in records:
+        if rec.get("type") != "step" or rec.get("tool") != "skill_load" or rec.get("kind") != "ok":
+            continue
+        args = rec.get("args")
+        name = args.get("name") if isinstance(args, dict) else None
+        if isinstance(name, str) and name not in out:
+            out.append(name)
+    return out
+
+
 def summarize(records: list[dict]) -> dict:
     """Run stats from the JSONL: status, step kinds, per-tool counts, tokens, elapsed.
 
@@ -247,6 +261,9 @@ def summarize(records: list[dict]) -> dict:
         "step_cap": (resumes[-1] if resumes else header).get("step_cap"),
         "policy": (resumes[-1] if resumes else header).get("policy"),
         "prompt_sources": header.get("prompt_sources") or [],
+        "skills_available": (header.get("skills") or {}).get("names") or [],
+        "skill_dirs": (header.get("skills") or {}).get("dirs") or [],
+        "skills_loaded": skills_loaded(records),
         "segments": 1 + len(resumes),
         "resumed_from": [r.get("from_status") for r in resumes],
         "status": footer.get("status", "incomplete"),
@@ -282,6 +299,10 @@ def format_summary(records: list[dict]) -> str:
                  f"text-only turns: {s['text_only']}  denied: {s['denied']}")
     if s["policy"]:
         lines.append(f"policy: {json.dumps(s['policy'], sort_keys=True)}")
+    if s["skills_available"] or s["skills_loaded"]:
+        lines.append(f"skills: loaded {', '.join(s['skills_loaded']) or '(none)'}"
+                     f"  ({len(s['skills_available'])} discovered in "
+                     f"{len(s['skill_dirs'])} director{'y' if len(s['skill_dirs']) == 1 else 'ies'})")
     lines.append("prompt: " + format_prompt_sources(s["prompt_sources"]))
     lines.append("kinds: " + (", ".join(f"{k} {n}" for k, n in s["kinds"].items()) or "(none)"))
     lines.append("tools:")

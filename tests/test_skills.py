@@ -4,13 +4,19 @@ Every skill directory here is a fixture under tmp_path. The conftest fixture
 points HOME at a throwaway directory, so nothing reads the machine's own
 ~/.config/harness/skills.
 """
+import json
 import os
 from pathlib import Path
 
 import pytest
 
+from harness.context import EVICTED
+from harness.registry import ToolRegistry, ToolSpec
+from harness.runtime import META_NAMES, SKILL_META_NAMES, AgentRuntime, RuntimeConfig
 from harness.skills import (NoFrontmatter, SkillError, discover, load_skill,
                             parse_frontmatter, search_dirs)
+from harness.trajectory import format_summary, read_trajectory, summarize
+from harness.transport import FakeTransport, call
 
 INVESTIGATE = """---
 description: Answer a question about a codebase with evidence.
@@ -45,6 +51,38 @@ def skills_dir(tmp_path, name="skills", **files) -> Path:
     for skill, body in files.items():
         write(root / skill.replace("_", "-") / "SKILL.md", body)
     return root
+
+
+def todo(status="completed", id="1"):
+    return call("todo_write", {"todos": [{"id": id, "content": "do the work", "status": status}]})
+
+
+FINISH = call("final_answer", {"status": "completed", "content": "done"})
+
+
+def registry_with_files():
+    r = ToolRegistry()
+    for name in ("fs_search", "fs_read", "run_shell"):
+        r.register(ToolSpec(name, f"Pretend {name}.", {"type": "object", "properties": {}, "required": []},
+                            lambda name=name: f"{name} ran"))
+    return r
+
+
+def tool_names(request):
+    return {t["function"]["name"] for t in request["tools"]}
+
+
+def run_with_skills(tmp_path, script, dirs, run_id="skills", config=None, registry=None):
+    """A scripted run whose runtime was given whatever ``dirs`` hold."""
+    found = discover(dirs, tmp_path)
+    fake = FakeTransport(script)
+    rt = AgentRuntime(registry if registry is not None else registry_with_files(), fake,
+                      tmp_path / "runs", "fake", config or RuntimeConfig(), run_id=run_id, skills=found)
+    return rt.run("a task"), fake, found
+
+
+def steps_of(res):
+    return [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
 
 
 # ---- format ---------------------------------------------------------------
@@ -145,3 +183,187 @@ def test_search_dirs_order_is_config_env_project_then_flags(tmp_path, monkeypatc
     home_skills = tmp_path / "home" / ".config" / "harness" / "skills"
     assert search_dirs([tmp_path / "nowhere"]) == [home_skills]   # a missing directory is not searched
     assert config.is_dir()                                   # not searched: it is nobody's location
+
+
+# ---- the meta-tools, through the runtime ----------------------------------
+
+
+def test_list_then_load_puts_the_skill_in_context_and_activates_its_tools(tmp_path):
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE, tidy=TIDY)
+    script = [
+        {"content": "What skills are there?", "tool_calls": [call("skill_list", {})]},
+        {"content": "investigate matches; loading it.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Following it.", "tool_calls": [call("fs_search", {})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, fake, found = run_with_skills(tmp_path, script, [root])
+    assert res.status == "completed"
+
+    steps = steps_of(res)
+    assert [(s["tool"], s["kind"]) for s in steps] == [
+        ("skill_list", "ok"), ("skill_load", "ok"), ("fs_search", "ok"),
+        ("todo_write", "ok"), ("final_answer", "final_accepted")]
+    assert json.loads(steps[0]["result_preview"]) == [
+        {"name": "investigate", "description": "Answer a question about a codebase with evidence."},
+        {"name": "tidy-up", "description": "Leave the workdir clean."}]
+
+    loaded = (res.run_dir / steps[1]["artifact"]).read_text(encoding="utf-8")
+    assert loaded.startswith("skill 'investigate' loaded (")
+    assert "activated fs_search, fs_read" in loaded
+    assert found.get("investigate").body in loaded
+
+    # guarantee 1 still: skills are meta, the tools they declare are not in
+    # context until the load activates them
+    assert tool_names(fake.requests[0]) == META_NAMES | SKILL_META_NAMES
+    assert tool_names(fake.requests[2]) == META_NAMES | SKILL_META_NAMES | {"fs_search", "fs_read"}
+    # and the whole skill reached the model as the tool result
+    result = [m for m in fake.requests[2]["messages"] if m["role"] == "tool"][-1]
+    assert "fs_glob for the shape of the tree." in result["content"]
+
+    state = json.loads((res.run_dir / "state.json").read_text())
+    assert state["loaded_skills"] == ["investigate"]
+    assert state["active_tools"] == ["fs_search", "fs_read"]
+
+
+def test_a_run_without_skills_starts_with_exactly_the_six_meta_tools(tmp_path):
+    empty = tmp_path / "no-skills"
+    empty.mkdir()
+    script = [{"content": "Trying a skill tool anyway.", "tool_calls": [call("skill_list", {})]},
+              {"content": "Done.", "tool_calls": [todo(), FINISH]}]
+    res, fake, found = run_with_skills(tmp_path, script, [empty], run_id="bare")
+    assert len(found) == 0 and res.status == "completed"
+    assert tool_names(fake.requests[0]) == META_NAMES
+    assert not (META_NAMES & SKILL_META_NAMES)
+    steps = steps_of(res)
+    assert steps[0]["kind"] == "error" and "unknown tool 'skill_list'" in steps[0]["result_preview"]
+    # searched, and empty: the header says so rather than staying silent
+    assert read_trajectory(res.run_dir)[0]["skills"] == {"dirs": [str(empty)], "names": []}
+
+
+def test_unknown_oversized_and_repeated_loads(tmp_path):
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE)
+    write(root / "huge" / "SKILL.md", "---\ndescription: A very long skill.\n---\n" + "x" * 500)
+    script = [
+        {"content": "Loading something that is not there.", "tool_calls": [call("skill_load", {"name": "nope"})]},
+        {"content": "The big one, then.", "tool_calls": [call("skill_load", {"name": "huge"})]},
+        {"content": "investigate it is.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Again, by accident.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, fake, _ = run_with_skills(tmp_path, script, [root], run_id="edges",
+                                   config=RuntimeConfig(skill_chars=200))
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:4]] == ["error", "error", "ok", "ok"]
+    assert "unknown skill 'nope'. Available: huge, investigate" in steps[0]["result_preview"]
+    assert "is 500 chars, over the 200 char limit" in steps[1]["result_preview"]
+    assert "--skill-chars" in steps[1]["result_preview"]
+    assert steps[3]["result_preview"] == "skill 'investigate' is already loaded; its text is above in this conversation."
+
+    state = json.loads((res.run_dir / "state.json").read_text())
+    assert state["loaded_skills"] == ["investigate"]          # the refused ones left nothing behind
+    assert state["active_tools"] == ["fs_search", "fs_read"]
+    # the second load added no second copy of the text
+    tool_msgs = [m for m in fake.requests[4]["messages"] if m["role"] == "tool"]
+    assert sum("fs_glob for the shape" in m["content"] for m in tool_msgs) == 1
+
+
+def test_unload_frees_the_context_and_leaves_the_tools_active(tmp_path):
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE)
+    script = [
+        {"content": "Loading.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Done with it.", "tool_calls": [call("skill_unload", {"name": "investigate"})]},
+        {"content": "Unloading it twice.", "tool_calls": [call("skill_unload", {"name": "investigate"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, fake, found = run_with_skills(tmp_path, script, [root], run_id="unload")
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:3]] == ["ok", "ok", "error"]
+    freed = json.loads(steps[1]["result_preview"])
+    assert freed["unloaded"] == "investigate" and freed["loaded"] == []
+    assert freed["context_freed_chars"] > len(found.get("investigate").body) - 200
+    assert "is not loaded" in steps[2]["result_preview"]
+
+    last = fake.requests[-1]["messages"]
+    skill_msg = [m for m in last if m["role"] == "tool"][0]
+    assert skill_msg["content"] == "[skill 'investigate' unloaded; its text is out of context. skill_load reads it again.]"
+    assert "fs_glob for the shape" not in json.dumps(last)
+    state = json.loads((res.run_dir / "state.json").read_text())
+    assert state["loaded_skills"] == [] and state["active_tools"] == ["fs_search", "fs_read"]
+
+
+def test_a_loaded_skill_is_neither_truncated_nor_evicted(tmp_path):
+    """The model was told to follow the skill; a budget that quietly removed it
+    would leave it following something it can no longer read."""
+    root = tmp_path / "skills"
+    body = "\n".join(f"Step {i}: do the thing carefully." for i in range(40))
+    write(root / "long" / "SKILL.md", f"---\ndescription: A long guide.\n---\n{body}")
+    r = ToolRegistry()
+    r.register(ToolSpec("big", "Return a lot.", {"type": "object", "properties": {}, "required": []},
+                        lambda: "B" * 900))
+    script = [
+        {"content": "Loading the guide.", "tool_calls": [call("skill_load", {"name": "long"})]},
+        {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["big"]})]},
+    ] + [{"content": f"call {i}", "tool_calls": [call("big", {})]} for i in range(5)] + [
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    cfg = RuntimeConfig(result_context_chars=200, context_budget_chars=2500)
+    res, fake, _ = run_with_skills(tmp_path, script, [root], run_id="evict", config=cfg, registry=r)
+    assert res.status == "completed"
+
+    tool_msgs = [m for m in fake.requests[-1]["messages"] if m["role"] == "tool"]
+    assert any(m["content"].startswith(EVICTED[:20]) for m in tool_msgs)   # other results went
+    skill_msg = tool_msgs[0]
+    assert body in skill_msg["content"]                                    # whole, untruncated
+    assert "truncated at 200" not in skill_msg["content"]
+
+
+def test_a_skill_can_bring_its_own_tools_through_a_plugin(tmp_path):
+    root = tmp_path / "skills"
+    write(root / "counting" / "tools.py", '''
+def register(registry, workdir):
+    @registry.tool("count_lines", "Count the lines in a string.",
+                   {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]})
+    def count_lines(text: str) -> dict:
+        return {"lines": len(text.splitlines()), "workdir": workdir.name}
+''')
+    write(root / "counting" / "SKILL.md",
+          "---\ndescription: Count things.\ntools: [count_lines]\nplugin: ./tools.py\n---\nUse count_lines.\n")
+    write(root / "broken-plugin" / "SKILL.md",
+          "---\ndescription: Bring a plugin that is not there.\nplugin: ./gone.py\n---\nnothing\n")
+    script = [
+        {"content": "Loading a skill that brings a tool.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+        {"content": "Using it.", "tool_calls": [call("count_lines", {"text": "a\nb\nc"})]},
+        {"content": "And the broken one.", "tool_calls": [call("skill_load", {"name": "broken-plugin"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    work = tmp_path / "project"
+    work.mkdir()
+    found = discover([root], work)
+    fake = FakeTransport(script)
+    rt = AgentRuntime(registry_with_files(), fake, tmp_path / "runs", "fake", run_id="plug", skills=found)
+    res = rt.run("count things")
+
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:3]] == ["ok", "ok", "error"]
+    assert "plugin: registered count_lines." in steps[0]["result_preview"]
+    assert json.loads(steps[1]["result_preview"]) == {"lines": 3, "workdir": "project"}
+    assert "declares a plugin that will not load" in steps[2]["result_preview"]
+    assert "no such file" in steps[2]["result_preview"]
+    state = json.loads((res.run_dir / "state.json").read_text())
+    assert state["loaded_skills"] == ["counting"]
+
+
+def test_the_header_and_the_summary_say_which_skills_were_there_and_which_were_read(tmp_path):
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE, tidy=TIDY)
+    script = [
+        {"content": "Loading.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, _, _ = run_with_skills(tmp_path, script, [root], run_id="recorded")
+    records = read_trajectory(res.run_dir)
+    assert records[0]["skills"] == {"dirs": [str(root)], "names": ["investigate", "tidy-up"]}
+
+    s = summarize(records)
+    assert s["skills_available"] == ["investigate", "tidy-up"] and s["skills_loaded"] == ["investigate"]
+    assert s["skill_dirs"] == [str(root)]
+    assert "skills: loaded investigate  (2 discovered in 1 directory)" in format_summary(records)
