@@ -21,6 +21,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
 from .plugins import PluginError, load_all
@@ -28,7 +29,7 @@ from .policy import ToolPolicy
 from .prompts import GLOBAL_ENV, PromptError, resolve_system_prompt
 from .registry import ToolRegistry
 from .replay import compare
-from .resume import prepare as prepare_resume
+from .resume import prepare as prepare_resume, recorded_invocation, recorded_policy
 from .runtime import AgentRuntime, ResumeError, RuntimeConfig
 from .tools import register_default_tools, register_scratch_tools
 from .trajectory import format_summary, format_trace, read_trajectory
@@ -37,6 +38,7 @@ from .transport import ChatCompletionsTransport, Transport
 
 EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3, "stalled": 4}
 USAGE_ERROR = 64
+DEFAULT_TIMEOUT = 120.0
 # Fields the harness owns; --extra-body may not set them.
 RESERVED_BODY_KEYS = ("model", "messages", "tools", "tool_choice")
 
@@ -57,10 +59,9 @@ def _extra_body(raw: str | None) -> dict:
     return value
 
 
-def _transport(a: argparse.Namespace) -> Transport:
+def _transport(a: argparse.Namespace, extra: dict) -> Transport:
     """The provider adapter a run or resume will talk to. Raises ValueError on
-    a bad --extra-body or an option the provider refuses."""
-    extra = _extra_body(a.extra_body)
+    an option the provider refuses."""
     key = a.api_key or os.environ.get("HARNESS_API_KEY")
     if a.provider == "anthropic":
         return AnthropicMessagesTransport(endpoint=a.endpoint, api_key=key, timeout=a.timeout,
@@ -68,11 +69,31 @@ def _transport(a: argparse.Namespace) -> Transport:
     return ChatCompletionsTransport(endpoint=a.endpoint, api_key=key, timeout=a.timeout, extra=extra)
 
 
-def _policy(a: argparse.Namespace) -> ToolPolicy | None:
+def _policy(a: argparse.Namespace, recorded: Any = None) -> ToolPolicy | None:
     """--deny-tool / --deny-shell-pattern as a policy, or None. Raises ValueError
-    on a pattern that is not a regex."""
-    policy = ToolPolicy(deny_tools=a.deny_tool or [], deny_shell_patterns=a.deny_shell_pattern or [])
-    return policy or None
+    on a pattern that is not a regex.
+
+    ``recorded`` is the policy a run already ran under: with no flags given, a
+    resume or a replay keeps it rather than quietly dropping the denials.
+    """
+    if a.deny_tool or a.deny_shell_pattern:
+        policy = ToolPolicy(deny_tools=a.deny_tool or [], deny_shell_patterns=a.deny_shell_pattern or [])
+        return policy or None
+    return recorded
+
+
+def _invocation(a: argparse.Namespace, workdir: Path, extra: dict) -> dict:
+    """What a resume needs to reach the same provider with the same tools.
+    Deliberately never the API key: it would end up in the run directory."""
+    return {
+        "endpoint": a.endpoint,
+        "provider": a.provider,
+        "max_tokens": a.max_tokens,
+        "timeout": a.timeout,
+        "extra_body": dict(extra),
+        "tools": list(a.tools or []),
+        "workdir": str(workdir),
+    }
 
 
 def _system_prompt(a: argparse.Namespace) -> tuple[str, list[dict]]:
@@ -115,7 +136,8 @@ def _run(a: argparse.Namespace) -> int:
         print(f"run: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
     try:
-        transport = _transport(a)
+        extra = _extra_body(a.extra_body)
+        transport = _transport(a, extra)
         policy = _policy(a)
     except ValueError as e:
         print(f"run: {e}", file=sys.stderr)
@@ -134,7 +156,8 @@ def _run(a: argparse.Namespace) -> int:
         preview_chars=a.preview_chars,
     )
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
-                      run_id=a.run_id, policy=policy, prompt_sources=prompt_sources)
+                      run_id=a.run_id, policy=policy, prompt_sources=prompt_sources,
+                      invocation=_invocation(a, workdir, extra))
     # the scratch pad lives in the run directory, so it can only be rooted now
     register_scratch_tools(registry, rt.run_dir)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
@@ -152,7 +175,23 @@ def _resume(a: argparse.Namespace) -> int:
               "the conversation in state.json and is never re-resolved", file=sys.stderr)
         return USAGE_ERROR
     run_dir = Path(a.runs_dir) / a.run_id
-    workdir = Path(a.workdir).resolve()
+    try:
+        records = read_trajectory(run_dir)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 66
+    # everything the run recorded about how it was launched, minus the api key;
+    # an explicit flag still wins.
+    rec = recorded_invocation(records)
+    a.endpoint = a.endpoint or rec.get("endpoint")
+    if not a.endpoint:
+        print("resume: no --endpoint given and the run recorded none", file=sys.stderr)
+        return USAGE_ERROR
+    a.provider = a.provider or rec.get("provider") or "openai"
+    a.max_tokens = a.max_tokens if a.max_tokens is not None else (rec.get("max_tokens") or DEFAULT_MAX_TOKENS)
+    a.timeout = a.timeout if a.timeout is not None else (rec.get("timeout") or DEFAULT_TIMEOUT)
+    a.tools = a.tools or list(rec.get("tools") or [])
+    workdir = Path(a.workdir or rec.get("workdir") or ".").resolve()
     workdir.mkdir(parents=True, exist_ok=True)
     try:
         registry = _registry(a, workdir)
@@ -160,15 +199,19 @@ def _resume(a: argparse.Namespace) -> int:
         print(f"resume: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
     try:
-        transport = _transport(a)
-        policy = _policy(a)
+        extra = _extra_body(a.extra_body) if a.extra_body else dict(rec.get("extra_body") or {})
+        transport = _transport(a, extra)
+        policy = _policy(a, recorded_policy(records))
     except ValueError as e:
         print(f"resume: {e}", file=sys.stderr)
         return USAGE_ERROR
 
+    print(f"{a.provider} at {a.endpoint}  workdir {workdir}"
+          + (f"  tools {', '.join(a.tools)}" if a.tools else ""), file=sys.stderr)
     try:
         rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
-                                    step_cap=a.step_cap, policy=policy)
+                                    step_cap=a.step_cap, policy=policy,
+                                    invocation=_invocation(a, workdir, extra))
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
@@ -272,23 +315,35 @@ def build_parser() -> argparse.ArgumentParser:
                         help=f"ignore the global prompt (${GLOBAL_ENV}, "
                              "$XDG_CONFIG_HOME/harness/system.md, ~/.config/harness/system.md)")
 
-    def model_args(sp, *, model_required: bool) -> None:
-        """Everything needed to reach a provider. Shared by run and resume."""
+    def model_args(sp, *, model_required: bool, recorded: bool = False) -> None:
+        """Everything needed to reach a provider. Shared by run and resume.
+
+        With ``recorded``, every default is None: the run recorded what it was
+        launched with, so an omitted flag means "whatever it used", and only a
+        flag actually given overrides it.
+        """
+        was = " (default: what the run recorded)"
         sp.add_argument("--model", required=model_required, default=None,
-                        help="model id" + ("" if model_required else " (default: the one the run recorded)"))
-        sp.add_argument("--endpoint", required=True,
+                        help="model id" + ("" if model_required else was))
+        sp.add_argument("--endpoint", required=not recorded, default=None,
                         help="provider base URL, e.g. http://localhost:8080/v1 or "
-                             "https://api.anthropic.com/v1")
-        sp.add_argument("--provider", choices=("openai", "anthropic"), default="openai",
+                             "https://api.anthropic.com/v1" + (was if recorded else ""))
+        sp.add_argument("--provider", choices=("openai", "anthropic"),
+                        default=None if recorded else "openai",
                         help="wire format: OpenAI-compatible /chat/completions (default) "
-                             "or the Anthropic Messages API")
-        sp.add_argument("--api-key", default=None, help="or set HARNESS_API_KEY")
-        sp.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
-                        help=f"response cap, anthropic provider only (default: {DEFAULT_MAX_TOKENS})")
-        sp.add_argument("--timeout", type=float, default=120.0)
+                             "or the Anthropic Messages API" + (was if recorded else ""))
+        sp.add_argument("--api-key", default=None, help="or set HARNESS_API_KEY (never recorded)")
+        sp.add_argument("--max-tokens", type=int, default=None if recorded else DEFAULT_MAX_TOKENS,
+                        help="response cap, anthropic provider only "
+                             + (was if recorded else f"(default: {DEFAULT_MAX_TOKENS})"))
+        sp.add_argument("--timeout", type=float, default=None if recorded else DEFAULT_TIMEOUT,
+                        help="seconds per request"
+                             + (was if recorded else f" (default: {DEFAULT_TIMEOUT:g})"))
         sp.add_argument("--extra-body", default=None, metavar="JSON",
-                        help='extra provider request parameters, e.g. \'{"temperature": 0}\'')
-        sp.add_argument("--workdir", default=".", help="root for fs_* and run_shell tools")
+                        help='extra provider request parameters, e.g. \'{"temperature": 0}\''
+                             + (was if recorded else ""))
+        sp.add_argument("--workdir", default=None if recorded else ".",
+                        help="root for fs_* and run_shell tools" + (was if recorded else ""))
         sp.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
         sp.add_argument("--deny-tool", action="append", metavar="NAME",
                         help="refuse this tool; the model sees the refusal as the result. Repeatable.")
@@ -310,7 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     rs = sub.add_parser("resume", help="continue an interrupted run (transport_error, step_cap, stalled)")
     rs.add_argument("run_id")
-    model_args(rs, model_required=False)
+    model_args(rs, model_required=False, recorded=True)
     rs.add_argument("--step-cap", type=int, default=None,
                     help="raise the cap for the rest of the run (default: the cap it ran under)")
     prompt_args(rs)      # accepted so the refusal can explain itself, never applied

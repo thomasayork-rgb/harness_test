@@ -212,6 +212,7 @@ class _MockServer:
         self._index = 0
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._port: int | None = None
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -220,6 +221,7 @@ class _MockServer:
             return _Handler(*args, mock=self, **kwargs)
 
         self._httpd = ThreadingHTTPServer((self.host, 0), factory)
+        self._port = self._httpd.server_address[1]
         self._httpd.daemon_threads = True
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -243,9 +245,11 @@ class _MockServer:
 
     @property
     def port(self) -> int:
-        if self._httpd is None:
-            raise RuntimeError("server not started")
-        return self._httpd.server_address[1]
+        """The port it is on, or was on: a test that asserts on the endpoint a
+        run recorded reads this after the server has been shut down."""
+        if self._port is None:
+            raise RuntimeError("server not started yet")
+        return self._port
 
     @property
     def base_url(self) -> str:

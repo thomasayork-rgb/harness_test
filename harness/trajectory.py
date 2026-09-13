@@ -12,8 +12,10 @@ One JSONL file per run. Record types:
             boundaries survive the round trip (see harness.replay)
   footer  - terminal status, step count, final answer
 
-The header (and each resume record) also carries ``policy``: what the tool-call
-policy in force denied, or null.
+The header (and each resume record) also carries ``policy`` - what the
+tool-call policy in force denied, or null - and ``invocation``: how the segment
+was launched (endpoint, provider, workdir, tool modules, request options), so a
+resume can default to it. Never the API key.
   resume  - a seam between two segments of the same run: what the previous
             segment ended with, and the model and config the next one starts
             with (see harness.resume)
@@ -60,7 +62,8 @@ class TrajectoryWriter:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def header(self, *, run_id: str, model: str, step_cap: int, task: str, config: dict,
-               policy: Any = None, prompt_sources: list[dict] | None = None) -> None:
+               policy: Any = None, prompt_sources: list[dict] | None = None,
+               invocation: dict | None = None) -> None:
         self._write({
             "type": "header",
             "run_id": run_id,
@@ -72,6 +75,7 @@ class TrajectoryWriter:
             "config": config,
             "policy": policy,
             "prompt_sources": prompt_sources or [],
+            "invocation": invocation or {},
         })
 
     def write_artifact(self, step: int, tool: str | None, text: str) -> str:
@@ -117,7 +121,7 @@ class TrajectoryWriter:
 
     def resume(self, *, run_id: str, model: str, from_status: str, from_step: int,
                from_detail: str | None, step_cap: int, config: dict, note: str,
-               policy: Any = None) -> None:
+               policy: Any = None, invocation: dict | None = None) -> None:
         self._write({
             "type": "resume",
             "run_id": run_id,
@@ -130,6 +134,7 @@ class TrajectoryWriter:
             "step_cap": step_cap,
             "config": config,
             "policy": policy,
+            "invocation": invocation or {},
             "note": note,
         })
 

@@ -295,3 +295,127 @@ def test_resume_keeps_going_when_the_endpoint_is_still_down(tmp_path):
     assert [r["type"] for r in recs] == ["header", "footer", "resume", "footer"]
     assert server.served == 4                               # two attempts per segment
     assert summarize(recs)["segments"] == 2 and summarize(recs)["status"] == "transport_error"
+
+
+SHOUT_PLUGIN = '''
+def register(registry, workdir):
+    @registry.tool("shout", "Upper-case a string.",
+                   {"type": "object", "properties": {"s": {"type": "string"}}, "required": ["s"]})
+    def shout(s: str) -> str:
+        return s.upper()
+'''
+
+SECRET = "sekret"
+
+
+def test_resume_defaults_every_provider_flag_from_the_recording(tmp_path):
+    """The run id and the api key are enough: endpoint, provider, workdir,
+    --tools, --extra-body and the policy all come back out of the recording."""
+    runs, work = tmp_path / "runs", tmp_path / "project"
+    work.mkdir()
+    (work / "config.ini").write_text("[server]\nPORT = 8080\n", encoding="utf-8")
+    plugin = tmp_path / "shout_plugin.py"
+    plugin.write_text(SHOUT_PLUGIN, encoding="utf-8")
+
+    script = [
+        {"content": "Activating what I need.",
+         "tool_calls": [call("toolbelt_add", {"names": ["shout", "fs_read", "run_shell"]}, id="add")]},
+        {"content": "Planning.", "tool_calls": [todo("in_progress")]},
+        HttpError(500, "endpoint fell over"), HttpError(500, "still over"),   # one retry, then death
+        {"content": "Back. Using the plugin tool.", "tool_calls": [call("shout", {"s": "hi"}, id="s1")]},
+        {"content": "Reading the config in the workdir.",
+         "tool_calls": [call("fs_read", {"path": "config.ini"}, id="r1")]},
+        {"content": "Trying something the policy forbids.",
+         "tool_calls": [call("run_shell", {"command": "rm -rf /"}, id="sh1")]},
+        {"content": "Closing.", "tool_calls": [todo("completed")]},
+        {"content": "Finishing.", "tool_calls": [FINISH]},
+    ]
+
+    with MockOpenAIServer(script, model="mock-model", api_key=SECRET) as server:
+        rc = main(["--runs-dir", str(runs), "run", "--task", "find the port", "--model", "mock-model",
+                   "--endpoint", server.base_url, "--workdir", str(work), "--run-id", "defaults",
+                   "--api-key", SECRET, "--tools", str(plugin), "--extra-body", '{"temperature": 0}',
+                   "--deny-shell-pattern", r"rm\s+-rf"])
+        assert rc == 2
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--runs-dir", str(runs), "resume", "defaults",
+             "--api-key", SECRET],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+        bodies = [r["body"] for r in server.requests]
+
+    assert proc.returncode == 0, proc.stderr
+    assert "all echoed" in proc.stdout
+    assert f"openai at {server.base_url}  workdir {work}  tools {plugin}" in proc.stderr
+
+    recs = read_trajectory(runs / "defaults")
+    steps = [r for r in recs if r["type"] == "step"]
+    assert [(s["tool"], s["kind"]) for s in steps] == [
+        ("toolbelt_add", "ok"), ("todo_write", "ok"),
+        ("shout", "ok"),            # --tools was loaded again
+        ("fs_read", "ok"),          # rooted at the recorded workdir, not the cwd
+        ("run_shell", "denied"),    # the recorded policy is still in force
+        ("todo_write", "ok"), ("final_answer", "final_accepted")]
+    assert steps[2]["result_preview"] == "HI"
+    assert "PORT = 8080" in steps[3]["result_preview"]
+    assert all(b.get("temperature") == 0 for b in bodies)          # recorded --extra-body
+    assert bodies[-1]["model"] == "mock-model"
+
+    invocation = recs[0]["invocation"]
+    assert invocation == {"endpoint": server.base_url, "provider": "openai", "max_tokens": 4096,
+                          "timeout": 120.0, "extra_body": {"temperature": 0},
+                          "tools": [str(plugin)], "workdir": str(work)}
+    seam = next(r for r in recs if r["type"] == "resume")
+    assert seam["invocation"] == invocation                        # carried forward for the next one
+    assert seam["policy"] == {"deny_tools": [], "deny_shell_patterns": [r"rm\s+-rf"],
+                              "shell_tools": ["run_shell"]}
+
+    # the api key is never recorded state
+    blob = (runs / "defaults" / "trajectory.jsonl").read_text() + \
+           (runs / "defaults" / "state.json").read_text()
+    assert SECRET not in blob and "api_key" not in blob
+
+
+def test_explicit_flags_override_the_recorded_invocation(tmp_path, capsys):
+    runs, work, other = tmp_path / "runs", tmp_path / "project", tmp_path / "elsewhere"
+    work.mkdir(), other.mkdir()
+    (other / "other.ini").write_text("[other]\n", encoding="utf-8")
+
+    with MockOpenAIServer([HttpError(500, "down")] * 2, model="recorded-model") as dead:
+        rc = main(["--runs-dir", str(runs), "run", "--task", "t", "--model", "recorded-model",
+                   "--endpoint", dead.base_url, "--workdir", str(work), "--run-id", "override",
+                   "--deny-tool", "fs_read"])
+    assert rc == 2                                     # transport_error, resumable
+
+    rest = [
+        {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["fs_read", "fs_glob"]})]},
+        {"content": "Planning.", "tool_calls": [todo("in_progress")]},
+        {"content": "fs_read was denied before; it is allowed now.",
+         "tool_calls": [call("fs_read", {"path": "other.ini"})]},
+        {"content": "And the new denial bites.", "tool_calls": [call("fs_glob", {"pattern": "*"})]},
+        {"content": "Closing.", "tool_calls": [todo("completed")]},
+        {"content": "Finishing.", "tool_calls": [FINISH]},
+    ]
+    with MockOpenAIServer(rest, model="live-model") as live:
+        rc = main(["--runs-dir", str(runs), "resume", "override", "--endpoint", live.base_url,
+                   "--workdir", str(other), "--deny-tool", "fs_glob", "--model", "live-model"])
+        bodies = [r["body"] for r in live.requests]
+    assert rc == 0
+
+    steps = [r for r in read_trajectory(runs / "override") if r["type"] == "step"]
+    assert [(s["tool"], s["kind"]) for s in steps[2:4]] == [("fs_read", "ok"), ("fs_glob", "denied")]
+    assert "[other]" in steps[2]["result_preview"]     # the workdir override took effect
+    assert bodies[0]["model"] == "live-model"
+
+    seam = next(r for r in read_trajectory(runs / "override") if r["type"] == "resume")
+    assert seam["invocation"]["endpoint"] == live.base_url
+    assert seam["invocation"]["workdir"] == str(other)
+    assert seam["policy"]["deny_tools"] == ["fs_glob"]
+
+
+def test_resume_without_a_recorded_endpoint_says_so(tmp_path, capsys):
+    """A run driven from Python records no invocation; the CLI still needs one."""
+    first = capped_run(tmp_path, run_id="bare")
+    rc = main(["--runs-dir", str(tmp_path / "runs"), "resume", "bare", "--step-cap", "9"])
+    assert rc == 64 and "no --endpoint given and the run recorded none" in capsys.readouterr().err
+    assert [r["type"] for r in read_trajectory(first.run_dir)].count("resume") == 0

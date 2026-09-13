@@ -73,12 +73,12 @@ Same script shape as `FakeTransport`; `server.requests` records every wire reque
 python -m harness --runs-dir RUNS trace RUN_ID              # readable trace
 python -m harness --runs-dir RUNS trace RUN_ID --step 7     # one step in full, artifact included
 python -m harness --runs-dir RUNS trace RUN_ID --summary    # status, kinds, per-tool counts, tokens
-python -m harness --runs-dir RUNS resume RUN_ID --endpoint URL [--step-cap N]   # after transport_error, step_cap, stalled
+python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N]  # after transport_error, step_cap, stalled
 python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
 python -m harness tools [--tools SPEC]                      # what the agent can discover
 ```
 
-`--runs-dir` is a global option and goes **before** the subcommand. `resume` needs `--endpoint`, `--tools`, `--provider` and policy flags again; they are not recorded state. Replaying a run that edited files needs a pristine workdir. For experiments, point `--runs-dir` and `--workdir` at scratch space, never at the repo.
+`--runs-dir` is a global option and goes **before** the subcommand. `resume` defaults `--endpoint`, `--provider`, `--workdir`, `--tools`, `--extra-body`, `--max-tokens`, `--timeout` and the policy to what the run recorded in its trajectory header (`invocation`); an explicit flag overrides. The API key is never recorded, and prompt flags are refused. Replaying a run that edited files needs a pristine workdir. For experiments, point `--runs-dir` and `--workdir` at scratch space, never at the repo.
 
 ### Plugins and policy
 

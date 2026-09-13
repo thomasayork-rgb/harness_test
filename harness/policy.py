@@ -10,7 +10,9 @@ becomes the tool's result, so the model reads it and can adapt, and the step is
 recorded in the trajectory with ``kind: "denied"`` - distinct from ``error``,
 because the tool did not fail, it did not run.
 
-``ToolPolicy`` is the concrete one the CLI exposes::
+``ToolPolicy`` is the concrete one the CLI exposes, and ``from_description``
+rebuilds one from what a trajectory recorded, so ``resume`` and ``replay``
+keep the denials the original run ran under::
 
     ToolPolicy(deny_tools=["run_shell"], deny_shell_patterns=[r"rm\\s+-rf", r"\\bcurl\\b"])
 
@@ -67,3 +69,17 @@ class ToolPolicy:
         return {"deny_tools": list(self.deny_tools),
                 "deny_shell_patterns": [p.pattern for p in self.patterns],
                 "shell_tools": sorted(self.shell_tools)}
+
+
+def from_description(described: Any) -> "ToolPolicy | None":
+    """The policy a run recorded, rebuilt - for ``resume`` and ``replay``.
+
+    ``None`` for a run that had no policy, and for one whose policy was not a
+    ``ToolPolicy``: the header holds a repr of those, not something to rebuild.
+    """
+    if not isinstance(described, dict):
+        return None
+    policy = ToolPolicy(deny_tools=described.get("deny_tools") or [],
+                        deny_shell_patterns=described.get("deny_shell_patterns") or [],
+                        shell_tools=described.get("shell_tools") or ("run_shell",))
+    return policy or None

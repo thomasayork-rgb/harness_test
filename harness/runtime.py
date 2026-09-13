@@ -191,12 +191,16 @@ class AgentRuntime:
         state: RunState | None = None,
         policy: Any = None,
         prompt_sources: list[dict] | None = None,
+        invocation: dict | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
         self.model = model
         self.config = config or RuntimeConfig()
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+        # how this run was launched: endpoint, provider, workdir, tool modules.
+        # Recorded so `resume` can default to it; never holds the API key.
+        self.invocation = dict(invocation or {})
         # where that prompt came from, for the header (see harness.prompts)
         self.prompt_sources = prompt_sources or [
             {"source": BUILTIN if system_prompt is None else PROVIDED,
@@ -339,7 +343,8 @@ class AgentRuntime:
         ]
         self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task,
                            config=asdict(cfg), policy=self._policy_description(),
-                           prompt_sources=list(self.prompt_sources))
+                           prompt_sources=list(self.prompt_sources),
+                           invocation=dict(self.invocation))
         st.save(self.state_path)
         return self._loop()
 
@@ -369,7 +374,8 @@ class AgentRuntime:
                                   step=st.step, cap=cfg.step_cap)
         self.writer.resume(run_id=self.run_id, model=self.model, from_status=st.status,
                            from_step=st.step, from_detail=detail, step_cap=cfg.step_cap,
-                           config=asdict(cfg), note=note, policy=self._policy_description())
+                           config=asdict(cfg), note=note, policy=self._policy_description(),
+                           invocation=dict(self.invocation))
         st.messages.append({"role": "user", "content": note})
         st.status = "running"
         st.save(self.state_path)

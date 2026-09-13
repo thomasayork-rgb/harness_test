@@ -3,9 +3,10 @@
 A run that ended with ``transport_error``, ``step_cap`` or ``stalled`` stopped
 for a reason outside the task: the endpoint fell over, the budget ran out, the
 model went quiet. Everything needed to carry on is already on disk - the
-conversation and tool state in ``state.json``, the configuration in the
-trajectory header - so resuming is rebuilding the runtime around that state and
-calling ``resume()`` instead of ``run()``::
+conversation and tool state in ``state.json``, the configuration, the policy
+and the invocation (endpoint, provider, workdir, tool modules; never the API
+key) in the trajectory header - so resuming is rebuilding the runtime around
+that state and calling ``resume()`` instead of ``run()``::
 
     from harness.resume import resume
 
@@ -22,11 +23,33 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .policy import from_description
 from .registry import ToolRegistry
 from .runtime import (RESUMABLE, AgentRuntime, ResumeError, RunResult, RunState,
                       effective_config)
 from .trajectory import last, read_trajectory
 from .transport import Transport
+
+
+def _last_setting(records: list[dict], key: str, default: Any = None) -> Any:
+    """The value a trajectory ended under for a header/resume field. A resumed
+    run records its own settings at the seam, so the last segment wins."""
+    value = default
+    for rec in records:
+        if rec.get("type") in ("header", "resume") and key in rec:
+            value = rec[key]
+    return value
+
+
+def recorded_invocation(records: list[dict]) -> dict:
+    """How the last segment was launched: endpoint, provider, workdir, tool
+    modules, request options. ``{}`` for a run recorded before this existed."""
+    return _last_setting(records, "invocation") or {}
+
+
+def recorded_policy(records: list[dict]) -> Any:
+    """The tool-call policy the last segment ran under, rebuilt, or None."""
+    return from_description(_last_setting(records, "policy"))
 
 
 def load(run_dir: Any) -> tuple[RunState, list[dict]]:
@@ -51,9 +74,13 @@ def prepare(
     model: str | None = None,
     step_cap: int | None = None,
     policy: Any = None,
+    invocation: dict | None = None,
 ) -> tuple[AgentRuntime, str | None]:
     """Rebuild the runtime for a resumable run. Returns it with the detail of
-    the footer that closed the previous segment, for ``AgentRuntime.resume``."""
+    the footer that closed the previous segment, for ``AgentRuntime.resume``.
+
+    ``invocation`` is what the new segment runs under, recorded at the seam for
+    the next resume; it defaults to what the recording already says."""
     path = Path(run_dir)
     state, records = load(path)
     if state.status not in RESUMABLE:
@@ -64,7 +91,8 @@ def prepare(
     if step_cap is not None:
         config.step_cap = step_cap
     runtime = AgentRuntime(registry, transport, path.parent, model or state.model, config,
-                           run_id=path.name, state=state, policy=policy)
+                           run_id=path.name, state=state, policy=policy,
+                           invocation=invocation or recorded_invocation(records))
     return runtime, last(records, "footer").get("detail")
 
 
@@ -76,8 +104,9 @@ def resume(
     model: str | None = None,
     step_cap: int | None = None,
     policy: Any = None,
+    invocation: dict | None = None,
 ) -> RunResult:
     """Continue a run in place. The trajectory grows; it is not replaced."""
     runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap,
-                              policy=policy)
+                              policy=policy, invocation=invocation)
     return runtime.resume(detail)
