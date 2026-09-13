@@ -36,7 +36,7 @@ from .plugins import PluginError, load_tools
 from .prompts import BUILTIN, PROVIDED, SYSTEM_PROMPT, TEXT_ONLY_NUDGE, builtin_prompt
 from .registry import ToolRegistry, validate_args
 from .skills import SkillSet
-from .todo import apply_update, open_ids, validate_todos
+from .todo import NOTES_MAX, apply_update, open_ids, signature, validate_todos
 from .trajectory import TrajectoryWriter
 from .transport import Transport, TransportError
 
@@ -63,11 +63,12 @@ META_TOOLS: list[dict] = [
     }},
     {"type": "function", "function": {
         "name": "todo_write",
-        "description": "Create or update the todo list. merge=true updates by id; merge=false replaces the list.",
+        "description": "Create or update the todo list. merge=true updates by id, keeping a note the update omits; merge=false replaces the list. Record the outcome of each item in its notes.",
         "parameters": {"type": "object", "properties": {
             "todos": {"type": "array", "items": {"type": "object", "properties": {
                 "id": {"type": "string"}, "content": {"type": "string"},
                 "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]},
+                "notes": {"type": "string", "description": f"what happened with this item: the value, the path, the command and its result (max {NOTES_MAX} chars)"},
             }, "required": ["id", "content", "status"]}},
             "merge": {"type": "boolean"},
         }, "required": ["todos"]},

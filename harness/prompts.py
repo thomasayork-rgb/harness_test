@@ -37,7 +37,7 @@ DISCOVERY. Only meta-tools are in context; everything else you must discover.
 - toolbelt_add(names): activate tools so you can call them.
 - toolbelt_remove(names): drop tools you are done with, to keep context small.
 
-PLAN. Call todo_write before substantive work: a few concrete steps with ids you reuse. Mark one in_progress when you start it, completed when it is done, cancelled if you decide against it. final_answer is rejected while any todo is pending or in_progress, and rejected if there is no list at all.
+PLAN. Call todo_write before substantive work: a few concrete steps with ids you reuse. Mark one in_progress when you start it, completed when it is done, cancelled if you decide against it. As you close each one, put its outcome in notes - the value, the path, the command and what it said - so the plan records what happened, not just that it happened. final_answer is rejected while any todo is pending or in_progress, and rejected if there is no list at all.
 
 RESULTS. Read every result before deciding the next call.
 - An error result says what went wrong. Fix the arguments, pick another tool, or check your assumption; never repeat a failing call unchanged.
