@@ -100,12 +100,18 @@ class ReplayTransport:
 
 
 def replay(run_dir: Any, registry: ToolRegistry, runs_dir: Path | None = None,
-           run_id: str | None = None, config: RuntimeConfig | None = None) -> RunResult:
-    """Re-drive a recorded run against ``registry``. Returns the new RunResult."""
+           run_id: str | None = None, config: RuntimeConfig | None = None,
+           policy: Any = None) -> RunResult:
+    """Re-drive a recorded run against ``registry``. Returns the new RunResult.
+
+    A tool-call policy is not part of the recording: pass one here to replay
+    under it, otherwise a call the original run denied runs for real, which the
+    comparison reports as drift.
+    """
     transport = ReplayTransport(run_dir)
     target = Path(runs_dir) if runs_dir is not None else Path(run_dir).parent
     return AgentRuntime(registry, transport, target, transport.model,
-                        config or transport.config,
+                        config or transport.config, policy=policy,
                         run_id=run_id or f"{transport.run_id}-replay").run(transport.task)
 
 

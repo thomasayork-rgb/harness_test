@@ -9,6 +9,9 @@ One JSONL file per run. Record types:
             call_index: the position of this call in its model turn, so turn
             boundaries survive the round trip (see harness.replay)
   footer  - terminal status, step count, final answer
+
+The header (and each resume record) also carries ``policy``: what the tool-call
+policy in force denied, or null.
   resume  - a seam between two segments of the same run: what the previous
             segment ended with, and the model and config the next one starts
             with (see harness.resume)
@@ -54,7 +57,8 @@ class TrajectoryWriter:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def header(self, *, run_id: str, model: str, step_cap: int, task: str, config: dict) -> None:
+    def header(self, *, run_id: str, model: str, step_cap: int, task: str, config: dict,
+               policy: Any = None) -> None:
         self._write({
             "type": "header",
             "run_id": run_id,
@@ -64,6 +68,7 @@ class TrajectoryWriter:
             "step_cap": step_cap,
             "task": task,
             "config": config,
+            "policy": policy,
         })
 
     def write_artifact(self, step: int, tool: str | None, text: str) -> str:
@@ -108,7 +113,8 @@ class TrajectoryWriter:
         })
 
     def resume(self, *, run_id: str, model: str, from_status: str, from_step: int,
-               from_detail: str | None, step_cap: int, config: dict, note: str) -> None:
+               from_detail: str | None, step_cap: int, config: dict, note: str,
+               policy: Any = None) -> None:
         self._write({
             "type": "resume",
             "run_id": run_id,
@@ -120,6 +126,7 @@ class TrajectoryWriter:
             "from_detail": from_detail,
             "step_cap": step_cap,
             "config": config,
+            "policy": policy,
             "note": note,
         })
 
@@ -213,6 +220,7 @@ def summarize(records: list[dict]) -> dict:
         "harness_version": header.get("harness_version"),
         "task": header.get("task"),
         "step_cap": (resumes[-1] if resumes else header).get("step_cap"),
+        "policy": (resumes[-1] if resumes else header).get("policy"),
         "segments": 1 + len(resumes),
         "resumed_from": [r.get("from_status") for r in resumes],
         "status": footer.get("status", "incomplete"),
@@ -246,6 +254,8 @@ def format_summary(records: list[dict]) -> str:
     lines.append(f"tokens: {s['tokens_in']} in / {s['tokens_out']} out")
     lines.append(f"errors: {s['errors']}  rejected finals: {s['rejected_finals']}  "
                  f"text-only turns: {s['text_only']}  denied: {s['denied']}")
+    if s["policy"]:
+        lines.append(f"policy: {json.dumps(s['policy'], sort_keys=True)}")
     lines.append("kinds: " + (", ".join(f"{k} {n}" for k, n in s["kinds"].items()) or "(none)"))
     lines.append("tools:")
     width = max((len(t) for t in s["tools"]), default=0)

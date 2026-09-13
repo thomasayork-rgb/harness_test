@@ -15,6 +15,8 @@ Failure semantics (all deliberate, all visible in the trajectory):
                                 N consecutive → status "stalled"
   transport error             → retry once, then status "transport_error"
   step cap                    → status "step_cap", final null
+  policy denies a call        → the denial as the tool result, kind "denied";
+                                loop continues (see harness.policy)
 
 A run that ended in one of RESUMABLE can be picked up again: rebuild the
 runtime from the persisted state and call ``resume()`` instead of ``run()``.
@@ -93,6 +95,10 @@ RESUME_NOTE = ("This run was interrupted ({status}: {detail}) and has been resum
 # tool_call and no matching tool message is malformed, and a resumed run would
 # send exactly that back to the provider.
 NOT_EXECUTED = "error: not executed: {reason}"
+
+# A denied call is not an error: the tool did not fail, it never ran. Its own
+# kind keeps the two apart in a trace and in trace --summary.
+DENIAL = "denied: {reason}"
 _META_PARAMS = {t["function"]["name"]: t["function"]["parameters"] for t in META_TOOLS}
 
 
@@ -183,12 +189,15 @@ class AgentRuntime:
         system_prompt: str | None = None,
         run_id: str | None = None,
         state: RunState | None = None,
+        policy: Any = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
         self.model = model
         self.config = config or RuntimeConfig()
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+        # policy(name, args) -> denial message or None; see harness.policy
+        self.policy = policy or None
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
         self.run_dir = Path(runs_dir) / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +229,14 @@ class AgentRuntime:
     # ---- dispatch ---------------------------------------------------------
 
     def _dispatch(self, name: str, args: Any) -> tuple[str, str]:
-        """Returns (result_text, kind). kind ∈ ok | error | final_accepted | final_rejected."""
+        """Returns (result_text, kind). kind ∈ ok | error | denied | final_accepted | final_rejected."""
+        if self.policy is not None:
+            try:
+                verdict = self.policy(name, args)
+            except Exception as e:  # noqa: BLE001 - a broken policy must not kill the run
+                return f"error: policy raised {type(e).__name__}: {e}", "error"
+            if verdict:
+                return DENIAL.format(reason=verdict), "denied"
         if name in META_NAMES:
             err = validate_args(_META_PARAMS[name], args)
             if err:
@@ -286,6 +302,13 @@ class AgentRuntime:
         self.state.final = {"status": args["status"], "content": args["content"]}
         return _to_text({"accepted": True}), "final_accepted"
 
+    def _policy_description(self) -> Any:
+        """What the header records about the policy in force, if it can say."""
+        describe = getattr(self.policy, "describe", None)
+        if callable(describe):
+            return describe()
+        return None if self.policy is None else repr(self.policy)
+
     def _close_unexecuted(self, calls: list[dict], status: str) -> None:
         """Answer the calls of a turn that was cut short, so the transcript stays well formed."""
         reason = {
@@ -309,7 +332,8 @@ class AgentRuntime:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": task},
         ]
-        self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task, config=asdict(cfg))
+        self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task,
+                           config=asdict(cfg), policy=self._policy_description())
         st.save(self.state_path)
         return self._loop()
 
@@ -338,8 +362,8 @@ class AgentRuntime:
         note = RESUME_NOTE.format(status=st.status, detail=detail or "no detail",
                                   step=st.step, cap=cfg.step_cap)
         self.writer.resume(run_id=self.run_id, model=self.model, from_status=st.status,
-                           from_step=st.step, from_detail=detail,
-                           step_cap=cfg.step_cap, config=asdict(cfg), note=note)
+                           from_step=st.step, from_detail=detail, step_cap=cfg.step_cap,
+                           config=asdict(cfg), note=note, policy=self._policy_description())
         st.messages.append({"role": "user", "content": note})
         st.status = "running"
         st.save(self.state_path)

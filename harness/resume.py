@@ -50,6 +50,7 @@ def prepare(
     *,
     model: str | None = None,
     step_cap: int | None = None,
+    policy: Any = None,
 ) -> tuple[AgentRuntime, str | None]:
     """Rebuild the runtime for a resumable run. Returns it with the detail of
     the footer that closed the previous segment, for ``AgentRuntime.resume``."""
@@ -63,7 +64,7 @@ def prepare(
     if step_cap is not None:
         config.step_cap = step_cap
     runtime = AgentRuntime(registry, transport, path.parent, model or state.model, config,
-                           run_id=path.name, state=state)
+                           run_id=path.name, state=state, policy=policy)
     return runtime, last(records, "footer").get("detail")
 
 
@@ -74,7 +75,9 @@ def resume(
     *,
     model: str | None = None,
     step_cap: int | None = None,
+    policy: Any = None,
 ) -> RunResult:
     """Continue a run in place. The trajectory grows; it is not replaced."""
-    runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap)
+    runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap,
+                              policy=policy)
     return runtime.resume(detail)

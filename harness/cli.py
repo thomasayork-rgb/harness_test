@@ -1,7 +1,7 @@
 """CLI.
 
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
-                 [--provider openai|anthropic]
+                 [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
   harness resume <run_id> --endpoint http://host:port/v1 [--step-cap N]
   harness tools  [--tools mod] [--filter kw]
   harness trace  <run_id> [--step N | --summary]
@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
 from .plugins import PluginError, load_all
+from .policy import ToolPolicy
 from .registry import ToolRegistry
 from .replay import compare
 from .resume import prepare as prepare_resume
@@ -64,6 +65,13 @@ def _transport(a: argparse.Namespace) -> Transport:
     return ChatCompletionsTransport(endpoint=a.endpoint, api_key=key, timeout=a.timeout, extra=extra)
 
 
+def _policy(a: argparse.Namespace) -> ToolPolicy | None:
+    """--deny-tool / --deny-shell-pattern as a policy, or None. Raises ValueError
+    on a pattern that is not a regex."""
+    policy = ToolPolicy(deny_tools=a.deny_tool or [], deny_shell_patterns=a.deny_shell_pattern or [])
+    return policy or None
+
+
 def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
     """Built-in tools plus whatever each --tools module contributes."""
     registry = ToolRegistry()
@@ -92,6 +100,7 @@ def _run(a: argparse.Namespace) -> int:
         return USAGE_ERROR
     try:
         transport = _transport(a)
+        policy = _policy(a)
     except ValueError as e:
         print(f"run: {e}", file=sys.stderr)
         return USAGE_ERROR
@@ -103,7 +112,7 @@ def _run(a: argparse.Namespace) -> int:
         context_budget_chars=a.context_chars,
         preview_chars=a.preview_chars,
     )
-    rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, run_id=a.run_id)
+    rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, run_id=a.run_id, policy=policy)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
     res = rt.run(task)
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
@@ -123,12 +132,14 @@ def _resume(a: argparse.Namespace) -> int:
         return USAGE_ERROR
     try:
         transport = _transport(a)
+        policy = _policy(a)
     except ValueError as e:
         print(f"resume: {e}", file=sys.stderr)
         return USAGE_ERROR
 
     try:
-        rt, detail = prepare_resume(run_dir, registry, transport, model=a.model, step_cap=a.step_cap)
+        rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
+                                    step_cap=a.step_cap, policy=policy)
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
         res = rt.resume(detail)
@@ -220,6 +231,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help='extra provider request parameters, e.g. \'{"temperature": 0}\'')
         sp.add_argument("--workdir", default=".", help="root for fs_* and run_shell tools")
         sp.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
+        sp.add_argument("--deny-tool", action="append", metavar="NAME",
+                        help="refuse this tool; the model sees the refusal as the result. Repeatable.")
+        sp.add_argument("--deny-shell-pattern", action="append", metavar="REGEX",
+                        help="refuse run_shell commands matching this regex. Repeatable.")
 
     r = sub.add_parser("run", help="run a task")
     r.add_argument("--task")
