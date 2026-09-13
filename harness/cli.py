@@ -27,7 +27,7 @@ from .registry import ToolRegistry
 from .replay import compare
 from .resume import prepare as prepare_resume
 from .runtime import AgentRuntime, ResumeError, RuntimeConfig
-from .tools import register_default_tools
+from .tools import register_default_tools, register_scratch_tools
 from .trajectory import format_summary, format_trace, read_trajectory
 from .replay import replay as replay_run
 from .transport import ChatCompletionsTransport, Transport
@@ -113,6 +113,8 @@ def _run(a: argparse.Namespace) -> int:
         preview_chars=a.preview_chars,
     )
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, run_id=a.run_id, policy=policy)
+    # the scratch pad lives in the run directory, so it can only be rooted now
+    register_scratch_tools(registry, rt.run_dir)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
     res = rt.run(task)
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
@@ -140,6 +142,7 @@ def _resume(a: argparse.Namespace) -> int:
     try:
         rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
                                     step_cap=a.step_cap, policy=policy)
+        register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
         res = rt.resume(detail)
@@ -161,6 +164,8 @@ def _tools(a: argparse.Namespace) -> int:
     except PluginError as e:
         print(f"tools: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
+    # listing only: at run time these are rooted in the real run directory
+    register_scratch_tools(registry, Path(a.runs_dir) / "<run_id>")
     entries = registry.list(a.filter)
     width = max((len(e["name"]) for e in entries), default=0)
     for e in entries:

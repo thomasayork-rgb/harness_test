@@ -107,7 +107,8 @@ def test_tools_subcommand_lists_builtins_and_plugins(tmp_path, capsys):
     out = capsys.readouterr()
     assert rc == 0
     assert "fs_search" in out.out and "run_shell" in out.out and "coin_flip" not in out.out
-    assert "7 tool(s)" in out.err and "toolbelt_add" in out.err
+    assert "scratch_write" in out.out               # rooted in the run directory at run time
+    assert "10 tool(s)" in out.err and "toolbelt_add" in out.err
 
     rc = main(["tools", "--workdir", str(tmp_path),
                "--tools", write(tmp_path, "p_registry.py", REGISTRY_PLUGIN), "--filter", "coin"])
