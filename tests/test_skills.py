@@ -506,3 +506,29 @@ def test_a_recorded_skills_run_replays_as_a_skills_run(tmp_path):
     assert transport.skills.names() == ["investigate"]
     again = replay(res.run_dir, registry_with_files(), runs_dir=tmp_path / "runs")
     assert again.status == "completed" and compare(res.run_dir, again.run_dir) == []
+
+
+def test_a_skill_with_a_plugin_can_be_unloaded_and_loaded_again(tmp_path):
+    """The second load must not collide with the tools the first one registered."""
+    root = tmp_path / "skills"
+    write(root / "counting" / "tools.py", '''
+def register(registry):
+    @registry.tool("count_lines", "Count lines.", {"type": "object", "properties": {}, "required": []})
+    def count_lines() -> int:
+        return 1
+''')
+    write(root / "counting" / "SKILL.md",
+          "---\ndescription: Count things.\ntools: [count_lines]\nplugin: ./tools.py\n---\nUse count_lines.\n")
+    script = [
+        {"content": "Loading.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+        {"content": "Freeing the context.", "tool_calls": [call("skill_unload", {"name": "counting"})]},
+        {"content": "Needed it after all.", "tool_calls": [call("skill_load", {"name": "counting"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, _, _ = run_with_skills(tmp_path, script, [root], run_id="replug")
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:3]] == ["ok", "ok", "ok"]
+    assert "plugin: registered count_lines." in steps[0]["result_preview"]
+    assert "plugin: already registered." in steps[2]["result_preview"]
+    assert "already active: count_lines" in steps[2]["result_preview"]
+    assert json.loads((res.run_dir / "state.json").read_text())["loaded_skills"] == ["counting"]

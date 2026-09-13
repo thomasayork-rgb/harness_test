@@ -263,6 +263,9 @@ class AgentRuntime:
         # extra keys for the tool message of the call being dispatched, set by a
         # meta-tool that needs one (skill_load protects and un-truncates its own)
         self._annotate: dict = {}
+        # plugin modules skill_load has already registered in this process, so
+        # reloading a skill after unloading it does not collide with itself
+        self._skill_plugins: set[str] = set()
 
     # ---- request assembly -------------------------------------------------
 
@@ -363,14 +366,18 @@ class AgentRuntime:
             return (f"error: skill '{name}' is {skill.chars} chars, over the {self.config.skill_chars} "
                     "char limit for one skill (--skill-chars). It was not loaded."), "error"
 
+        plugin_note = ""
         if skill.plugin_path is not None:
-            try:
-                added = load_tools(self.registry, str(skill.plugin_path), self.skills.workdir or Path("."))
-            except PluginError as e:
-                return f"error: skill '{name}' declares a plugin that will not load: {e}", "error"
-            plugin_note = f"plugin: registered {', '.join(added) or 'nothing'}. "
-        else:
-            plugin_note = ""
+            module = str(skill.plugin_path)
+            if module in self._skill_plugins:
+                plugin_note = "plugin: already registered. "
+            else:
+                try:
+                    added = load_tools(self.registry, module, self.skills.workdir or Path("."))
+                except PluginError as e:
+                    return f"error: skill '{name}' declares a plugin that will not load: {e}", "error"
+                self._skill_plugins.add(module)
+                plugin_note = f"plugin: registered {', '.join(added) or 'nothing'}. "
 
         activated, already, unknown = [], [], []
         for tool in skill.tools:
