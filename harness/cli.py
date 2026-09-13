@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .registry import ToolRegistry
 from .runtime import AgentRuntime, RuntimeConfig
-from .tools import register_basic_tools
+from .tools import register_default_tools
 from .trajectory import format_trace, read_trajectory
 from .transport import ChatCompletionsTransport
 
@@ -34,7 +34,7 @@ def _run(a: argparse.Namespace) -> int:
     workdir.mkdir(parents=True, exist_ok=True)
 
     registry = ToolRegistry()
-    register_basic_tools(registry, workdir)
+    register_default_tools(registry, workdir)
 
     transport = ChatCompletionsTransport(
         endpoint=a.endpoint,

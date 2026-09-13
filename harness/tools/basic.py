@@ -5,16 +5,11 @@ import subprocess
 from pathlib import Path
 
 from ..registry import ToolRegistry
+from .paths import make_resolver
 
 
 def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
-    root = Path(workdir).resolve()
-
-    def resolve(rel: str) -> Path:
-        p = (root / rel).resolve()
-        if p != root and root not in p.parents:
-            raise PermissionError(f"path escapes workdir: {rel}")
-        return p
+    root, resolve = make_resolver(workdir)
 
     @registry.tool(
         "fs_list",
