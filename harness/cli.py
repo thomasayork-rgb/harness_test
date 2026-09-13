@@ -137,8 +137,13 @@ def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None)
     is said once, here, and never to the model.
     """
     flags = list(getattr(a, "skills", None) or [])
-    dirs = [Path(d) for d in recorded] if (recorded is not None and not flags) else \
-        search_dirs(flags, workdir)
+    if recorded is not None and not flags:
+        dirs = [Path(d) for d in recorded]
+    else:
+        for named in flags:
+            if not Path(named).expanduser().is_dir():
+                print(f"skills: --skills {named}: no such directory", file=sys.stderr)
+        dirs = search_dirs(flags, workdir)
     found = discover(dirs, workdir)
     for line in found.warnings():
         print(f"skills: {line}", file=sys.stderr)

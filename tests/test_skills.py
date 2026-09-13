@@ -400,6 +400,10 @@ def test_harness_skills_lists_what_the_agent_could_load(tmp_path, capsys, monkey
     assert main(["skills", "--workdir", str(work)]) == 0       # nothing anywhere: no output, no crash
     assert capsys.readouterr().out == ""
 
+    # a --skills directory that is not there is said out loud, not shrugged off
+    assert main(["skills", "--skills", str(tmp_path / "gone")]) == 0
+    assert f"skills: --skills {tmp_path / 'gone'}: no such directory" in capsys.readouterr().err
+
 
 def test_the_shipped_examples_are_loadable_skills():
     found = discover([REPO_ROOT / "examples" / "skills"])

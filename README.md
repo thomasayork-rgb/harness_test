@@ -181,7 +181,8 @@ Discovery merges every location that exists, lowest precedence first:
 | `--skills DIR` (repeatable, on `run`, `bench` and `resume`) | skills for this run |
 
 A name found twice is a clash: the last directory wins, and the clash is printed on stderr rather
-than silently decided. Nothing is loaded into context at discovery.
+than silently decided — as is a `--skills` directory that is not there, and a skill file that could
+not be read. Nothing is loaded into context at discovery.
 
 ```bash
 python -m harness skills --skills ./skills --workdir ./project [--filter kw]
