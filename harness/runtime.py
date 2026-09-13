@@ -35,7 +35,7 @@ from .transport import Transport, TransportError
 META_TOOLS: list[dict] = [
     {"type": "function", "function": {
         "name": "toolbelt_list",
-        "description": "List available tools: name and one-line description. Optional keyword filter.",
+        "description": "List available tools: name and one-line description. Optional keyword filter, matched against the name and that one line.",
         "parameters": {"type": "object", "properties": {"filter": {"type": "string"}}, "required": []},
     }},
     {"type": "function", "function": {
@@ -74,6 +74,14 @@ META_TOOLS: list[dict] = [
     }},
 ]
 META_NAMES = {t["function"]["name"] for t in META_TOOLS}
+
+# A turn can be cut short mid-way: the step cap trips between two calls of the
+# same turn, or final_answer is accepted and the run ends. The assistant
+# message is already in the transcript with every call it asked for, so the
+# calls that never ran still need a result - an OpenAI-shaped transcript with a
+# tool_call and no matching tool message is malformed, and a resumed run would
+# send exactly that back to the provider.
+NOT_EXECUTED = "error: not executed: {reason}"
 _META_PARAMS = {t["function"]["name"]: t["function"]["parameters"] for t in META_TOOLS}
 
 
@@ -235,6 +243,19 @@ class AgentRuntime:
         self.state.final = {"status": args["status"], "content": args["content"]}
         return _to_text({"accepted": True}), "final_accepted"
 
+    def _close_unexecuted(self, calls: list[dict], status: str) -> None:
+        """Answer the calls of a turn that was cut short, so the transcript stays well formed."""
+        reason = {
+            "step_cap": "the step cap was reached before this call ran",
+        }.get(status, "the run ended before this call ran")
+        for c in calls:
+            self.state.messages.append({
+                "role": "tool", "tool_call_id": c["id"],
+                "content": NOT_EXECUTED.format(reason=reason),
+                # no artifact to point at, so keep it out of the eviction pass
+                "_artifact": None, "_protected": True, "_unexecuted": True,
+            })
+
     # ---- the loop ---------------------------------------------------------
 
     def run(self, task: str) -> RunResult:
@@ -294,6 +315,7 @@ class AgentRuntime:
                 } for c in calls],
             })
 
+            executed = 0
             for index, c in enumerate(calls):
                 first = index == 0
                 if st.step >= cfg.step_cap:
@@ -313,10 +335,12 @@ class AgentRuntime:
                     "content": self.budget.truncate_result(result, art),
                     "_artifact": art, "_protected": c["name"] == "todo_write",
                 })
+                executed += 1
                 if kind == "final_accepted":
                     status = st.final["status"]  # type: ignore[index]
                     break
 
+            self._close_unexecuted(calls[executed:], status)
             self.budget.enforce(st.messages)
             st.save(self.state_path)
 

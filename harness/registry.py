@@ -40,10 +40,19 @@ class ToolSpec:
             },
         }
 
+    def summary(self) -> str:
+        """The description's first line, trimmed: the only prose the model sees
+        before activation, and therefore the only prose a filter may match."""
+        first_line = self.description.strip().splitlines()[0] if self.description else ""
+        return first_line[:120]
+
     def brief(self) -> dict:
         """One-line listing entry. This is all the model sees before activation."""
-        first_line = self.description.strip().splitlines()[0] if self.description else ""
-        return {"name": self.name, "description": first_line[:120]}
+        return {"name": self.name, "description": self.summary()}
+
+    def matches(self, needle: str) -> bool:
+        """Filter against exactly what a listing shows: the name and that one line."""
+        return needle in self.name.lower() or needle in self.summary().lower()
 
 
 class ToolRegistry:
@@ -83,11 +92,16 @@ class ToolRegistry:
         return sorted(self._tools)
 
     def list(self, filter: str | None = None) -> list[dict]:
+        """Name + first description line per tool, filtered on exactly that text.
+
+        Matching what the entry shows and no more: a filter that hit a detail
+        line the model never sees was worse than no match at all.
+        """
         needle = (filter or "").strip().lower()
         out = []
         for name in self.names():
             spec = self._tools[name]
-            if needle and needle not in name.lower() and needle not in spec.description.lower():
+            if needle and not spec.matches(needle):
                 continue
             out.append(spec.brief())
         return out

@@ -54,3 +54,18 @@ def test_todo_validate_and_merge():
     replaced = apply_update(cur, [{"id": "9", "content": "z", "status": "cancelled"}], merge=False)
     assert [t["id"] for t in replaced] == ["9"]
     assert open_ids(replaced) == []
+
+
+def test_filter_matches_exactly_what_the_listing_shows():
+    r = ToolRegistry()
+    r.register(ToolSpec("alpha", "Do alpha things.\nDetail line nobody sees mentions zebras.",
+                        {"type": "object", "properties": {}, "required": []}, lambda: "a"))
+    r.register(ToolSpec("zebra_count", "Count stripes.",
+                        {"type": "object", "properties": {}, "required": []}, lambda: "z"))
+    # the needle is matched against the name and the first line, which is all
+    # `list` returns; a hit on a hidden line would be a hit the model cannot see
+    assert [e["name"] for e in r.list("zebra")] == ["zebra_count"]
+    assert r.list("alpha things") == [{"name": "alpha", "description": "Do alpha things."}]
+    assert r.list("ALPHA") == [{"name": "alpha", "description": "Do alpha things."}]
+    assert r.list("nothing here") == []
+    assert r.get("alpha").summary() == "Do alpha things."

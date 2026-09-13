@@ -19,8 +19,8 @@ def registry_with(n=25):
     return r
 
 
-def todo(*items, merge=True):
-    return call("todo_write", {"todos": [{"id": i, "content": c, "status": s} for i, c, s in items], "merge": merge})
+def todo(*items, merge=True, id=None):
+    return call("todo_write", {"todos": [{"id": i, "content": c, "status": s} for i, c, s in items], "merge": merge}, id=id)
 
 
 def tool_names(request):
@@ -190,3 +190,60 @@ def test_plain_text_cannot_finish(tmp_path):
     ])
     res = AgentRuntime(registry_with(1), fake, tmp_path, "fake").run("t")
     assert res.status == "completed" and res.steps == 3
+
+
+def test_step_cap_mid_turn_answers_every_tool_call_it_recorded(tmp_path):
+    """The cap can trip between two calls of one turn. The persisted transcript
+    must still answer every tool_call the assistant made, or a resumed run would
+    send a malformed conversation back to the provider."""
+    fake = FakeTransport([
+        {"content": "Three calls in one turn; the cap trips after the second.",
+         "tool_calls": [call("toolbelt_list", {}, id="c1"),
+                        call("toolbelt_list", {}, id="c2"),
+                        call("toolbelt_list", {}, id="c3")]},
+    ])
+    rt = AgentRuntime(registry_with(2), fake, tmp_path, "fake", RuntimeConfig(step_cap=2), run_id="midcap")
+    res = rt.run("t")
+    assert res.status == "step_cap" and res.steps == 2
+
+    steps = [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
+    assert [s["step"] for s in steps] == [1, 2]          # the third call never ran, so it is not a step
+    state = json.loads((res.run_dir / "state.json").read_text())
+    requested = [tc["id"] for m in state["messages"] if m.get("tool_calls") for tc in m["tool_calls"]]
+    answered = [m["tool_call_id"] for m in state["messages"] if m["role"] == "tool"]
+    assert requested == ["c1", "c2", "c3"] == answered
+    last = state["messages"][-1]
+    assert last["role"] == "tool" and "step cap was reached" in last["content"]
+
+
+def test_accepted_final_answer_also_answers_the_rest_of_its_turn(tmp_path):
+    fake = FakeTransport([
+        {"content": "", "tool_calls": [todo(("1", "x", "completed"), id="t1")]},
+        {"content": "Finishing, and asking for one more thing after it.",
+         "tool_calls": [call("final_answer", {"status": "completed", "content": "done"}, id="f1"),
+                        call("toolbelt_list", {}, id="after")]},
+    ])
+    res = AgentRuntime(registry_with(1), fake, tmp_path, "fake", run_id="tail").run("t")
+    assert res.status == "completed" and res.steps == 2
+    state = json.loads((res.run_dir / "state.json").read_text())
+    requested = [tc["id"] for m in state["messages"] if m.get("tool_calls") for tc in m["tool_calls"]]
+    answered = [m["tool_call_id"] for m in state["messages"] if m["role"] == "tool"]
+    assert requested == ["t1", "f1", "after"] == answered
+    assert "the run ended" in state["messages"][-1]["content"]
+
+
+def test_toolbelt_list_filter_matches_only_the_line_the_model_sees(tmp_path):
+    r = registry_with(2)
+    r.register(ToolSpec("hidden_detail", "Do one visible thing.\nThe detail line mentions zebras.",
+                        {"type": "object", "properties": {}, "required": []}, lambda: "x"))
+    fake = FakeTransport([
+        {"content": "", "tool_calls": [call("toolbelt_list", {"filter": "zebras"}, id="a")]},
+        {"content": "", "tool_calls": [call("toolbelt_list", {"filter": "visible thing"}, id="b")]},
+        {"content": "", "tool_calls": [todo(("1", "x", "completed")),
+                                       call("final_answer", {"status": "completed", "content": "ok"})]},
+    ])
+    res = AgentRuntime(r, fake, tmp_path, "fake", run_id="filter").run("t")
+    steps = [s for s in read_trajectory(res.run_dir) if s["type"] == "step"]
+    assert json.loads(steps[0]["result_preview"]) == []   # matched a line the listing never shows
+    assert json.loads(steps[1]["result_preview"]) == [
+        {"name": "hidden_detail", "description": "Do one visible thing."}]

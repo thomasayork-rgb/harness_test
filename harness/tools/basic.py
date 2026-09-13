@@ -71,9 +71,12 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
          "required": ["command"]},
     )
     def run_shell(command: str, timeout: int = 60) -> dict:
+        # A non-zero exit is a result: the command ran and said no. A timeout is
+        # a tool failure, so it raises and lands in the trajectory as kind
+        # "error" rather than hiding inside an "ok" result.
         try:
             proc = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, timeout=timeout)
         except subprocess.TimeoutExpired:
-            return {"command": command, "error": f"timed out after {timeout}s"}
+            raise TimeoutError(f"command timed out after {timeout}s: {command}") from None
         return {"command": command, "exit_code": proc.returncode,
                 "stdout": proc.stdout[-20000:], "stderr": proc.stderr[-5000:]}

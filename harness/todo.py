@@ -40,11 +40,9 @@ def apply_update(current: list[dict], update: list[dict], merge: bool) -> list[d
     by_id = {t["id"]: dict(t) for t in current}
     order = [t["id"] for t in current]
     for t in clean:
-        if t["id"] in by_id:
-            by_id[t["id"]] = t
-        else:
-            by_id[t["id"]] = t
+        if t["id"] not in by_id:
             order.append(t["id"])
+        by_id[t["id"]] = t
     return [by_id[i] for i in order]
 
 
