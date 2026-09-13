@@ -1,0 +1,107 @@
+# harness
+
+Minimal zero-dependency ReAct agent runtime for any OpenAI-compatible chat-completions endpoint, or the Anthropic Messages API with `--provider anthropic`. Four guarantees are enforced by the loop, never by the prompt:
+
+1. **Lazy toolbelt.** Only the six meta-tools are in context until the model calls `toolbelt_add`.
+2. **Todo gate.** `final_answer` is rejected while any todo is `pending`/`in_progress`, or before a todo list exists.
+3. **Think-before-act.** The assistant text on a tool-calling turn is that step's `reasoning`. Private reasoning channels (`reasoning_content`, `reasoning`, `thinking`) are never read.
+4. **Trajectory export.** One JSONL per run (header, one record per tool call, footer; a `resume` record and another footer per resumed segment); full results in `artifacts/`.
+
+`README.md` documents the command surface, the JSONL record fields, resume semantics and the failure-semantics table. This file is about how to work on the harness and how to use it while you do.
+
+## Rules
+
+- `harness/` is **stdlib only** and **Python 3.10+** (no `tomllib`, no `except*`, no 3.11-only syntax). Tests use pytest only.
+- Preserve the four guarantees and the failure semantics. A change to either is a documented decision, not a side effect.
+- Never surface a private reasoning channel as `reasoning` or write it to the trajectory or artifacts.
+- A tool's description **first line** is all the model sees in `toolbelt_list`; put detail on a second line for `toolbelt_inspect`. Schemas are validated before the call; raise errors the model can act on.
+- File tools are rooted to the workdir through `harness/tools/paths.py`: refuse escapes, never clamp. Scratch tools are rooted to the run directory. Error messages show paths relative to the root, never absolute host paths. `run_shell` is rooted but not sandboxed; `--deny-shell-pattern` exists for that.
+- Every tool and every failure path is tested **through the runtime**: a scripted `FakeTransport` run through `toolbelt_add`, the call, and `final_answer`, asserting the JSONL records and artifacts. Anything CLI-facing also gets an end-to-end test over HTTP against a mock server.
+- No network in tests except mock servers you start on localhost. Never probe the environment for credentials or try to reach a live model.
+- Any new option, subcommand or tool is documented in `README.md` in the same terse style, and `python -m harness --help` stays coherent.
+- Checks before every commit:
+
+```bash
+python3 -m pytest -q
+python3 -m compileall -q harness tests
+```
+
+- Commit in logical units with descriptive messages. `runs/`, `__pycache__/` and `.pytest_cache/` are gitignored; never commit a run directory. Do not push or open pull requests unless asked.
+
+## Using the harness while developing
+
+### Scripted run (unit level)
+
+```python
+from harness.runtime import AgentRuntime
+from harness.trajectory import read_trajectory
+from harness.transport import FakeTransport, TransportError, call
+
+fake = FakeTransport([
+    {"content": "Listing tools.",  "tool_calls": [call("toolbelt_list", {})]},
+    {"content": "Activating.",     "tool_calls": [call("toolbelt_add", {"names": ["fs_search"]})]},
+    {"content": "Planning.",       "tool_calls": [call("todo_write", {"todos": [
+        {"id": "find", "content": "find the port", "status": "in_progress"}]})]},
+    {"content": "Searching.",      "tool_calls": [call("fs_search", {"pattern": "(?i)port"})]},
+    {"content": "Closing, done.",  "tool_calls": [
+        call("todo_write", {"todos": [{"id": "find", "content": "find the port", "status": "completed"}]}),
+        call("final_answer", {"status": "completed", "content": "8080"})]},
+])
+rt = AgentRuntime(registry, fake, runs_dir, "fake")      # registry: a ToolRegistry with your tools registered
+res = rt.run("Find the port")                            # policy=ToolPolicy(...) to test denials
+steps = [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
+```
+
+Assert on each step's `tool`, `kind` (`ok | error | denied | final_accepted | final_rejected | text_only`), `result_preview` and artifact file, and on `fake.requests[i]["tools"]` for what was in context on request `i`. A script entry that is an `Exception` instance is raised instead of returned (`TransportError(...)` for a transport failure). Several `tool_calls` in one entry make one turn with several steps; give them explicit ids, since `call()` defaults the id from the tool name.
+
+### Real process over HTTP (integration level)
+
+```python
+from harness.mockserver import HttpError, MockAnthropicServer, MockOpenAIServer
+
+with MockOpenAIServer(script, model="mock-model", api_key="k") as server:
+    subprocess.run([sys.executable, "-m", "harness", "--runs-dir", str(runs), "run",
+                    "--task", task, "--model", "mock-model", "--endpoint", server.base_url,
+                    "--workdir", str(work), "--api-key", "k"], capture_output=True, text=True)
+```
+
+Same script shape as `FakeTransport`; `server.requests` records every wire request so you can assert what reached the endpoint. `MockAnthropicServer` serves the same script as Messages API content blocks for `--provider anthropic`. An `HttpError(500)` entry yields a transport error. See `tests/test_e2e_http.py` and `tests/test_anthropic.py`.
+
+### Reading a run back, resuming, replaying
+
+```bash
+python -m harness --runs-dir RUNS trace RUN_ID              # readable trace
+python -m harness --runs-dir RUNS trace RUN_ID --step 7     # one step in full, artifact included
+python -m harness --runs-dir RUNS trace RUN_ID --summary    # status, kinds, per-tool counts, tokens
+python -m harness --runs-dir RUNS resume RUN_ID --endpoint URL [--step-cap N]   # after transport_error, step_cap, stalled
+python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
+python -m harness tools [--tools SPEC]                      # what the agent can discover
+```
+
+`--runs-dir` is a global option and goes **before** the subcommand. `resume` needs `--endpoint`, `--tools`, `--provider` and policy flags again; they are not recorded state. Replaying a run that edited files needs a pristine workdir. For experiments, point `--runs-dir` and `--workdir` at scratch space, never at the repo.
+
+### Plugins and policy
+
+`--tools path/to/module.py` or `--tools dotted.module` (repeatable). The module exports either `registry` (a `ToolRegistry`) or `register(registry[, workdir])`. Nothing is auto-discovered. `--deny-tool NAME` and `--deny-shell-pattern REGEX` (repeatable) veto calls before dispatch; a denial is a `denied` step the model can read, not a crash.
+
+## Layout
+
+```
+harness/
+  registry.py      ToolRegistry, ToolSpec, validate_args
+  runtime.py       AgentRuntime, RuntimeConfig, meta-tools, todo gate, the loop, resume()
+  todo.py          todo validation and merge
+  context.py       ContextBudget: per-result truncation, oldest-result eviction
+  transport.py     Transport protocol, ChatCompletionsTransport, FakeTransport, call()
+  anthropic.py     AnthropicMessagesTransport (stdlib only)
+  policy.py        ToolPolicy: the pre-dispatch veto
+  resume.py        load a run directory and rebuild the runtime around it
+  replay.py        ReplayTransport, replay(), compare()
+  plugins.py       --tools loading
+  mockserver.py    MockOpenAIServer, MockAnthropicServer for tests
+  trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
+  prompts.py       system prompt and nudge
+  cli.py           run / resume / tools / trace / replay
+  tools/           paths.py (rooting), basic.py, search.py, edit.py, scratch.py
+tests/             one module per area; the *_http and anthropic tests are the only real-HTTP tests
+```
