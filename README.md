@@ -2,10 +2,10 @@
 
 A minimal ReAct agent runtime with four guarantees the loop enforces, not the prompt:
 
-1. **Lazy toolbelt.** Every tool is registered; none is in context until the agent calls `toolbelt_add`. The first request carries only the six meta-tools.
+1. **Lazy toolbelt.** Every tool is registered; none is in context until the agent calls `toolbelt_add`. The first request carries only the meta-tools: the six core ones, and three more for skills when a run discovered any.
 2. **Todo gate.** `final_answer` is rejected while any todo is `pending` or `in_progress` (or before a todo list exists). Plain assistant text cannot end a run.
 3. **Think-before-act.** The assistant's text on each tool-calling turn is captured as that step's `reasoning`. No retry if it's empty. Private reasoning channels are never read.
-4. **Trajectory export.** One JSONL per run: header, one record per tool call (discovery and todo calls included), footer. Full tool results go to `artifacts/`; the JSONL carries a preview. `harness trace` reads it back.
+4. **Trajectory export.** One JSONL per run: header, one record per tool call (discovery, skill and todo calls included), a `note` record wherever the loop spoke up on its own, footer. Full tool results go to `artifacts/`; the JSONL carries a preview. `harness trace` reads it back.
 
 Plus a context budget so a local model survives a 60-step run: per-result truncation in context, oldest-result eviction past a total budget; reasoning, todo state and the results of the turn in flight are never evicted.
 
@@ -23,6 +23,7 @@ python -m harness run \
 python -m harness resume <run_id> --step-cap 400        # same flags as before, from the recording
 python -m harness bench tasks.jsonl --model m --endpoint http://localhost:8080/v1
 python -m harness tools                       # what the agent can discover
+python -m harness skills                      # what the agent can load
 python -m harness prompt [--sources]          # the system prompt a run would start with
 python -m harness trace <run_id>              # readable trace
 python -m harness trace <run_id> --step 7     # one step in full, artifact included
@@ -32,19 +33,21 @@ python -m harness replay <run_id> --workdir ./project   # re-run a recording aga
 
 `--api-key` or `HARNESS_API_KEY` for hosted endpoints. Runs land in `./runs/<run_id>/` (`--runs-dir` to move). Exit codes for `run` and `resume`: `0` completed, `1` blocked/failed, `2` transport_error, `3` step_cap, `4` stalled. For `replay`: `0` identical to the recording, `1` drifted. For `bench`: `0` if every task completed, `1` otherwise. A bad command line — including a run that cannot be resumed — is `64`, an unreadable run directory `66`.
 
-Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
+Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--skills ./skills` (repeatable), `--skill-chars 12000`, `--progress-nudge 12`, `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
 
 ## Run directory
 
 ```
 runs/<run_id>/
   trajectory.jsonl     header / step... / footer  (see Resume for a resumed run)
-  state.json           persisted RunState (active tools, todos, messages, final)
+  state.json           persisted RunState (active tools, loaded skills, todos, messages, final)
   artifacts/           step_0007_final_answer.txt — full result per step
   scratch/             notes the agent wrote with scratch_write
 ```
 
-Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, and `invocation`: the endpoint, provider, workdir, `--tools` modules and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
+Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step, notes included. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, `skills` (the directories searched and the names found), and `invocation`: the endpoint, provider, workdir, `--tools` modules, skill directories and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
+
+Two other record types sit in the same file. A `note` record — `{"type": "note", "step", "kind", "text"}` — is something the loop said to the model that is not a step: so far only the progress nudge. It does not count toward the step cap; `format_trace` prints it at the seam and `trace --summary` counts it. The footer carries `todos`: the todo list as it stood when the run ended, with its notes, whether or not there was a final answer.
 
 ## Failure semantics
 
@@ -56,6 +59,7 @@ Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_ind
 | transport error | one retry, then `transport_error` |
 | step cap | `step_cap`, `final` is `null` |
 | tool call denied by policy | denial string as the tool result, `kind: denied`; loop continues |
+| plan unchanged for `--progress-nudge` steps | one user message asking for the plan; a `note` record, not a step |
 
 All of it is visible in the trajectory. When a turn is cut short — the cap trips between two calls of it, or `final_answer` is accepted with calls queued behind it — the calls that never ran are answered in the persisted transcript with a "not executed" result, so every `tool_call` has a matching tool message and the conversation can be handed back to a provider.
 
@@ -67,7 +71,7 @@ All of it is visible in the trajectory. When a turn is cut short — the cap tri
 python -m harness resume <run_id> [--step-cap 400]
 ```
 
-Continues a run that ended with `transport_error`, `step_cap` or `stalled`. `completed`, `blocked` and `failed` are answers, not interruptions, and `running` means another process still owns the run: all four are refused with exit `64`. The run keeps its id, its directory and its step counter; `state.json` supplies the conversation, the active tools and the todos, and the trajectory header supplies the config (`--step-cap` raises the cap, and must, if the run is already at it). `--model` defaults to the one the run recorded, and `--endpoint`, `--provider`, `--workdir`, `--tools`, `--extra-body`, `--max-tokens`, `--timeout` and the policy flags default to the `invocation` and `policy` the last segment recorded, so `harness resume <run_id>` on its own continues the run as it was; an explicit flag overrides. The API key is never recorded, so `--api-key` (or `HARNESS_API_KEY`) is given again. Prompt flags are refused with exit `64`: the system prompt is part of the conversation in `state.json` and is never re-resolved.
+Continues a run that ended with `transport_error`, `step_cap` or `stalled`. `completed`, `blocked` and `failed` are answers, not interruptions, and `running` means another process still owns the run: all four are refused with exit `64`. The run keeps its id, its directory and its step counter; `state.json` supplies the conversation, the active tools and the todos, and the trajectory header supplies the config (`--step-cap` raises the cap, and must, if the run is already at it). `--model` defaults to the one the run recorded, and `--endpoint`, `--provider`, `--workdir`, `--tools`, `--skills`, `--extra-body`, `--max-tokens`, `--timeout` and the policy flags default to the `invocation` and `policy` the last segment recorded, so `harness resume <run_id>` on its own continues the run as it was; an explicit flag overrides. The skill directories come back as the run searched them, so a resumed segment can still `skill_load`; `--progress-nudge` is the one loop knob a resume can change on its own. The API key is never recorded, so `--api-key` (or `HARNESS_API_KEY`) is given again. Prompt flags are refused with exit `64`: the system prompt is part of the conversation in `state.json` and is never re-resolved.
 
 The trajectory is appended to, never replaced:
 
@@ -140,6 +144,106 @@ run id                  status     steps  tokens in  tokens out  elapsed
 A row per task is appended to `bench.jsonl` next to the run directories: `run_id, task, workdir, status, steps,
 tokens_in, tokens_out, elapsed_ms, wall_s, errors, denied, final`. Exit `0` if every task completed, `1`
 otherwise.
+
+## Skills
+
+A skill is a markdown document that teaches the model how to do one kind of work, discovered lazily
+and loaded on demand, in the same spirit as the toolbelt. Only names and one-line descriptions are
+held until the model asks for one.
+
+```
+skills/investigate/SKILL.md          or   skills/investigate.md
+```
+
+```markdown
+---
+name: code-change                    # optional; defaults to the directory or file stem
+description: Change code in a project safely: find it, read it, edit it exactly, run the tests.
+tools: [fs_search, fs_read, fs_edit, run_shell]     # activated when the skill is loaded
+plugin: ./tools.py                   # optional --tools module, relative to this file
+---
+The body is the skill: what the model should read before doing this kind of work.
+```
+
+The frontmatter is parsed with the stdlib alone — `key: value` scalars, `[a, b]` inline lists,
+`- item` block lists, indented continuation lines. `description` is required and its **first line**
+is all `skill_list` shows, so make it count; put the detail in the body. A `.md` file with no
+frontmatter is not a skill and is skipped; a `<name>/SKILL.md` that cannot be parsed is reported on
+stderr, once, and left out.
+
+Discovery merges every location that exists, lowest precedence first:
+
+| where | what for |
+|---|---|
+| `$XDG_CONFIG_HOME/harness/skills`, else `~/.config/harness/skills` | skills for every run on this machine |
+| `$HARNESS_SKILLS` (`os.pathsep`-separated) | skills for this shell |
+| `<workdir>/.harness/skills` | skills that live with the project |
+| `--skills DIR` (repeatable, on `run`, `bench` and `resume`) | skills for this run |
+
+A name found twice is a clash: the last directory wins, and the clash is printed on stderr rather
+than silently decided. Nothing is loaded into context at discovery.
+
+```bash
+python -m harness skills --skills ./skills --workdir ./project [--filter kw]
+python -m harness run --skills ./skills ...
+```
+
+Three meta-tools exist **only when at least one skill was discovered**, so a run without skills
+starts with exactly the six core ones:
+
+| tool | what it does |
+|---|---|
+| `skill_list(filter)` | name and first description line per skill, like `toolbelt_list` |
+| `skill_load(name)` | the whole skill text as the result; activates its `tools`, registers its `plugin` |
+| `skill_unload(name)` | replaces that text with a one-line marker, to free the context |
+
+A loaded skill is the one result that is never truncated by `--result-chars` and never evicted by
+the context budget: the model was told to follow it, so it has to still be there. The price is a
+size limit — a skill larger than `--skill-chars` (default 12000) is refused at load, with its size
+in the error. Loading a skill twice is a no-op that says so; unloading leaves the tools it activated
+active (`toolbelt_remove` drops them). The header records what was discovered, `skill_load` and
+`skill_unload` are ordinary steps, and `trace --summary` says which skills the run actually read.
+
+When skills are present the built-in prompt gains a short SKILLS section telling the model to list
+skills before planning and to follow what it loads; a run without skills is sent the prompt it was
+sent before, byte for byte.
+
+`examples/skills/` ships three to copy or point `--skills` at: `investigate` (answer a question
+about a codebase with evidence), `code-change` (find it, read it, edit it exactly, run the project's
+tests) and `final-report` (what belongs in `final_answer.content`).
+
+## Plan, notes and the progress nudge
+
+A todo item takes an optional `notes` string (500 chars): the outcome of that step, in the agent's
+own words — the value it found, the file it changed, the command it ran and what it said. On a merge
+a note survives an update that does not mention it, so closing an item costs nothing it recorded
+when it opened it; `notes: ""` clears one. Notes ride in every `todo_snapshot`, in `state.json`, and
+in the footer.
+
+```json
+{"id": "find", "content": "find the port", "status": "completed", "notes": "8080, conf/config.ini:2"}
+```
+
+Once a todo list exists, `--progress-nudge N` steps (default 12, `0` disables) with no change to any
+todo's status or notes append one user message asking the model to bring its plan up to date, and
+reset the counter. Text-only turns count toward it. It is recorded as a `note` record, it is not a
+step, and it does not count toward the step cap. A plan that keeps moving is never nudged.
+
+```
+  12  ok              run_shell                  28 ms  Running the project's own check.
+      -- progress_nudge after step 12: 5 steps since your todo list last changed. Update it now: ...
+  13  ok              todo_write                  1 ms  Right - two of those are done and the list does not say so.
+```
+
+`trace --summary` ends with the plan the run finished on:
+
+```
+todos:
+  [completed] find: find the port the service really uses
+      note: 8080: app/config.ini:2 and app/server.py:1; README.md:3 says 9090
+  [completed] fix: fix the port in README.md
+      note: README.md:3, 9090 -> 8080; diff is one line
+```
 
 ## Built-in tools
 
@@ -223,7 +327,7 @@ A denial is not an error — the tool did not fail, it never ran — so it gets 
 python -m harness run --deny-tool fs_edit --deny-shell-pattern 'rm\s+-rf' --deny-shell-pattern '\bcurl\b' ...
 ```
 
-Tool names are matched exactly; shell patterns are Python regexes searched against the `command` argument of `run_shell`. A policy is part of a recording: `replay` rebuilds the one the header describes, so a denied call stays denied instead of running for real and dragging every later step into drift. `replay(..., policy=...)` and `harness replay --deny-tool ...` replay under different rules; `policy=ToolPolicy()` under none.
+Tool names are matched exactly; shell patterns are Python regexes searched against the `command` argument of `run_shell`. A policy is part of a recording: `replay` rebuilds the one the header describes, so a denied call stays denied instead of running for real and dragging every later step into drift. The skill directories are rebuilt from the header for the same reason. `replay(..., policy=...)` and `harness replay --deny-tool ...` replay under different rules; `policy=ToolPolicy()` under none.
 
 ## Replay and the mock server
 
@@ -260,7 +364,9 @@ python -m pytest -q
 
 `tests/test_runtime.py::test_scripted_end_to_end_matches_jsonl_step_for_step` drives a fake transport through list → add → inspect → todo → rejected final → close → accepted final and asserts the JSONL step for step. Use `harness.transport.FakeTransport` the same way to test your own tools without a model.
 
-`tests/test_e2e_http.py` runs `python -m harness run` as a subprocess against the mock server and asserts the exit code, the run directory, the trajectory, the artifacts, and the guarantees on the wire. `tests/test_tools_fs.py` exercises each file tool through the runtime, error paths included; `tests/test_plugins.py` covers `--tools`; `tests/test_replay.py` records a run, replays it, and asserts the trajectories match step for step; `tests/test_resume.py` caps a run, kills one with a transport error, stalls one, resumes each and checks the seams; `tests/test_anthropic.py` asserts the Messages API wire format request by request; `tests/test_policy.py` and `tests/test_scratch.py` drive the denials and the pad through the runtime; `tests/test_prompts.py` covers the prompt layers, the provenance and `harness prompt` (with `HOME`, `XDG_CONFIG_HOME` and `HARNESS_SYSTEM_PROMPT` pointed at temporary directories, never the real ones); `tests/test_bench.py` benches two tasks over the mock server.
+`tests/test_e2e_http.py` runs `python -m harness run` as a subprocess against the mock server and asserts the exit code, the run directory, the trajectory, the artifacts, and the guarantees on the wire. `tests/test_tools_fs.py` exercises each file tool through the runtime, error paths included; `tests/test_plugins.py` covers `--tools`; `tests/test_replay.py` records a run, replays it, and asserts the trajectories match step for step; `tests/test_resume.py` caps a run, kills one with a transport error, stalls one, resumes each and checks the seams; `tests/test_anthropic.py` asserts the Messages API wire format request by request; `tests/test_policy.py` and `tests/test_scratch.py` drive the denials and the pad through the runtime; `tests/test_prompts.py` covers the prompt layers, the provenance and `harness prompt` (with `HOME`, `XDG_CONFIG_HOME` and `HARNESS_SYSTEM_PROMPT` pointed at temporary directories, never the real ones); `tests/test_bench.py` benches two tasks over the mock server; `tests/test_skills.py` covers the frontmatter, discovery and precedence, the three meta-tools through the runtime, `harness skills`, and a CLI run with `--skills` over HTTP; `tests/test_progress.py` covers todo notes, the nudge and the footer todos.
+
+`tests/test_e2e_complex.py` is the one that reads as the whole point: one real `python -m harness run` in which the model lists its skills, loads two of them, plans four todos, does the work with the file tools, records each outcome in a note, is nudged once for ignoring its plan, brings the plan back and finishes — asserted step for step, with the footer todos and the `trace --summary` a reader would run afterwards.
 
 ## Layout
 
@@ -277,9 +383,10 @@ harness/
   replay.py        ReplayTransport, replay, compare
   mockserver.py    MockOpenAIServer, MockAnthropicServer (scripted, stdlib http.server)
   plugins.py       --tools module loading
+  skills.py        SKILL.md frontmatter, discovery, SkillSet
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
   prompts.py       the prompt layers: built-in, global file, appends
-  cli.py           run / resume / bench / tools / prompt / trace / replay
+  cli.py           run / resume / bench / skills / tools / prompt / trace / replay
   tools/basic.py   fs_list, fs_read, fs_write, run_shell (rooted to --workdir)
   tools/search.py  fs_search, fs_glob
   tools/edit.py    fs_edit
@@ -287,5 +394,6 @@ harness/
   tools/paths.py   workdir rooting and the directory skip list
 examples/
   global-system.md an example global prompt: house rules for every run
+  skills/          investigate, code-change, final-report: skills to copy
 tests/
 ```
