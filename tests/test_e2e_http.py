@@ -69,7 +69,7 @@ def test_cli_run_over_http_end_to_end(tmp_path):
             [sys.executable, "-m", "harness", "--runs-dir", str(runs), "run",
              "--task", TASK, "--model", "mock-model", "--endpoint", server.base_url,
              "--workdir", str(work), "--run-id", "http-e2e", "--api-key", SECRET,
-             "--preview-chars", "200"],
+             "--preview-chars", "200", "--extra-body", '{"temperature": 0, "top_p": 0.9}'],
             cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
             env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
         )
@@ -118,6 +118,8 @@ def test_cli_run_over_http_end_to_end(tmp_path):
     assert {t["function"]["name"] for t in bodies[0]["tools"]} == META_NAMES
     assert {t["function"]["name"] for t in bodies[2]["tools"]} == META_NAMES | {"fs_search"}
     assert bodies[0]["tool_choice"] == "auto" and bodies[0]["model"] == "mock-model"
+    # --extra-body reached the provider on every request, without touching what the harness owns
+    assert all(b["temperature"] == 0 and b["top_p"] == 0.9 for b in bodies)
     assert all(r["headers"]["Authorization"] == f"Bearer {SECRET}" for r in server.requests)
     # the assistant turn and its tool result came back over the wire intact
     roles = [m["role"] for m in bodies[-1]["messages"]]
@@ -145,3 +147,14 @@ def test_bad_api_key_is_a_transport_error(tmp_path):
                    "--run-id", "auth", "--api-key", "wrong"])
     assert rc == 2
     assert "HTTP 401" in read_trajectory(runs / "auth")[-1]["detail"]
+
+
+def test_extra_body_must_be_a_json_object_without_reserved_keys(tmp_path, capsys):
+    def run(extra):
+        return main(["--runs-dir", str(tmp_path / "runs"), "run", "--task", "t", "--model", "m",
+                     "--endpoint", "http://127.0.0.1:1/v1", "--workdir", str(tmp_path),
+                     "--extra-body", extra])
+
+    assert run("{not json") == 64 and "not valid JSON" in capsys.readouterr().err
+    assert run("[1, 2]") == 64 and "must be a JSON object" in capsys.readouterr().err
+    assert run('{"messages": []}') == 64 and "may not set messages" in capsys.readouterr().err

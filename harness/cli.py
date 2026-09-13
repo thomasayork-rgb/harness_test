@@ -13,6 +13,7 @@ directory is 66.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -28,6 +29,24 @@ from .transport import ChatCompletionsTransport
 
 EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3, "stalled": 4}
 USAGE_ERROR = 64
+# Fields the harness owns; --extra-body may not set them.
+RESERVED_BODY_KEYS = ("model", "messages", "tools", "tool_choice")
+
+
+def _extra_body(raw: str | None) -> dict:
+    """Parse --extra-body into provider request parameters, e.g. {"temperature": 0}."""
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"--extra-body is not valid JSON: {e}") from None
+    if not isinstance(value, dict):
+        raise ValueError(f"--extra-body must be a JSON object, got {type(value).__name__}")
+    reserved = [k for k in value if k in RESERVED_BODY_KEYS]
+    if reserved:
+        raise ValueError(f"--extra-body may not set {', '.join(reserved)}; the harness owns those fields")
+    return value
 
 
 def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
@@ -56,11 +75,17 @@ def _run(a: argparse.Namespace) -> int:
     except PluginError as e:
         print(f"run: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
+    try:
+        extra = _extra_body(a.extra_body)
+    except ValueError as e:
+        print(f"run: {e}", file=sys.stderr)
+        return USAGE_ERROR
 
     transport = ChatCompletionsTransport(
         endpoint=a.endpoint,
         api_key=a.api_key or os.environ.get("HARNESS_API_KEY"),
         timeout=a.timeout,
+        extra=extra,
     )
     cfg = RuntimeConfig(
         step_cap=a.step_cap,
@@ -151,6 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--context-chars", type=int, default=60000)
     r.add_argument("--preview-chars", type=int, default=400)
     r.add_argument("--timeout", type=float, default=120.0)
+    r.add_argument("--extra-body", default=None, metavar="JSON",
+                   help='extra provider request parameters, e.g. \'{"temperature": 0}\'')
     r.set_defaults(fn=_run)
 
     l = sub.add_parser("tools", help="list registered tools (what the agent can discover)")
