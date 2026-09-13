@@ -3,7 +3,7 @@
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
                  [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
                  [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
-  harness resume <run_id> --endpoint http://host:port/v1 [--step-cap N]
+  harness resume <run_id> [--step-cap N]   (provider flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
   harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
@@ -12,8 +12,9 @@
 
 Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
 transport_error, 3 step_cap, 4 stalled. For replay: 0 identical to the
-recording, 1 drifted. For bench: 0 if every task completed, 1 otherwise. A bad command line (no task, unloadable --tools, a run
-that cannot be resumed) is 64; an unreadable run directory is 66.
+recording, 1 drifted. For bench: 0 if every task completed, 1 otherwise. A
+bad command line (no task, unloadable --tools, an unreadable prompt file, a
+run that cannot be resumed) is 64; an unreadable run directory is 66.
 """
 from __future__ import annotations
 
