@@ -15,6 +15,10 @@ Failure semantics (all deliberate, all visible in the trajectory):
                                 N consecutive → status "stalled"
   transport error             → retry once, then status "transport_error"
   step cap                    → status "step_cap", final null
+
+A run that ended in one of RESUMABLE can be picked up again: rebuild the
+runtime from the persisted state and call ``resume()`` instead of ``run()``.
+The loop is the same loop; only the way the conversation starts differs.
 """
 from __future__ import annotations
 
@@ -75,6 +79,13 @@ META_TOOLS: list[dict] = [
 ]
 META_NAMES = {t["function"]["name"] for t in META_TOOLS}
 
+# Statuses a run can be picked up from. completed/blocked/failed are answers,
+# not interruptions, and "running" means some other process still owns the run.
+RESUMABLE = ("transport_error", "step_cap", "stalled")
+
+RESUME_NOTE = ("This run was interrupted ({status}: {detail}) and has been resumed. "
+               "The conversation above is yours; continue from it. Step {step} of {cap}.")
+
 # A turn can be cut short mid-way: the step cap trips between two calls of the
 # same turn, or final_answer is accepted and the run ends. The assistant
 # message is already in the transcript with every call it asked for, so the
@@ -83,6 +94,10 @@ META_NAMES = {t["function"]["name"] for t in META_TOOLS}
 # send exactly that back to the provider.
 NOT_EXECUTED = "error: not executed: {reason}"
 _META_PARAMS = {t["function"]["name"]: t["function"]["parameters"] for t in META_TOOLS}
+
+
+class ResumeError(Exception):
+    """A run that cannot be resumed, with the reason the CLI should print."""
 
 
 @dataclass
@@ -94,6 +109,23 @@ class RuntimeConfig:
     preview_chars: int = 400
     text_only_limit: int = 3
     transport_retries: int = 1
+
+
+def config_from(stored: dict | None) -> RuntimeConfig:
+    """A RuntimeConfig from a recorded ``config`` block, ignoring fields this
+    version of the harness no longer knows about."""
+    known = set(RuntimeConfig.__dataclass_fields__)
+    return RuntimeConfig(**{k: v for k, v in (stored or {}).items() if k in known})
+
+
+def effective_config(records: list[dict]) -> RuntimeConfig:
+    """The config a trajectory ended under: the header's, or the last resume
+    record's if the run was resumed (a resume may raise the step cap)."""
+    stored: dict = {}
+    for rec in records:
+        if rec.get("type") in ("header", "resume") and rec.get("config"):
+            stored = rec["config"]
+    return config_from(stored)
 
 
 @dataclass
@@ -111,6 +143,15 @@ class RunState:
 
     def save(self, path: Path) -> None:
         path.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: Path) -> "RunState":
+        stored = json.loads(Path(path).read_text(encoding="utf-8"))
+        known = set(cls.__dataclass_fields__)
+        unknown = sorted(set(stored) - known)
+        if unknown:
+            raise ResumeError(f"{path}: unknown state field(s): {', '.join(unknown)}")
+        return cls(**stored)
 
 
 @dataclass
@@ -141,6 +182,7 @@ class AgentRuntime:
         config: RuntimeConfig | None = None,
         system_prompt: str | None = None,
         run_id: str | None = None,
+        state: RunState | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
@@ -153,7 +195,8 @@ class AgentRuntime:
         self.state_path = self.run_dir / "state.json"
         self.budget = ContextBudget(self.config.result_context_chars, self.config.context_budget_chars)
         self.writer = TrajectoryWriter(self.run_dir, preview_chars=self.config.preview_chars)
-        self.state = RunState(run_id=self.run_id, model=model, step_cap=self.config.step_cap)
+        self.state = state or RunState(run_id=self.run_id, model=model, step_cap=self.config.step_cap)
+        self.state.step_cap = self.config.step_cap
 
     # ---- request assembly -------------------------------------------------
 
@@ -259,6 +302,7 @@ class AgentRuntime:
     # ---- the loop ---------------------------------------------------------
 
     def run(self, task: str) -> RunResult:
+        """Start a fresh run: header, opening conversation, then the loop."""
         cfg = self.config
         st = self.state
         st.messages = [
@@ -267,7 +311,43 @@ class AgentRuntime:
         ]
         self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task, config=asdict(cfg))
         st.save(self.state_path)
+        return self._loop()
 
+    def resume(self, detail: str | None = None) -> RunResult:
+        """Continue an interrupted run from its persisted state.
+
+        ``detail`` is what killed the previous segment (the old footer's
+        detail), quoted back to the model in the resume note.
+
+        The trajectory is appended to, not replaced: a ``resume`` record marks
+        the seam and the step counter carries on, so one file still tells the
+        whole story. The conversation gets one user message saying what
+        happened, which also keeps the transcript ending on a user turn however
+        the previous segment died.
+        """
+        cfg = self.config
+        st = self.state
+        if st.status not in RESUMABLE:
+            raise ResumeError(
+                f"run {st.run_id} ended with status '{st.status}'; only "
+                f"{', '.join(RESUMABLE)} can be resumed")
+        if st.step >= cfg.step_cap:
+            raise ResumeError(
+                f"run {st.run_id} is at step {st.step} with cap {cfg.step_cap}; "
+                "raise it with --step-cap to resume")
+        note = RESUME_NOTE.format(status=st.status, detail=detail or "no detail",
+                                  step=st.step, cap=cfg.step_cap)
+        self.writer.resume(run_id=self.run_id, model=self.model, from_status=st.status,
+                           from_step=st.step, from_detail=detail,
+                           step_cap=cfg.step_cap, config=asdict(cfg), note=note)
+        st.messages.append({"role": "user", "content": note})
+        st.status = "running"
+        st.save(self.state_path)
+        return self._loop()
+
+    def _loop(self) -> RunResult:
+        cfg = self.config
+        st = self.state
         text_only = 0
         status = "running"
         detail: str | None = None

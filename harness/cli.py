@@ -1,14 +1,15 @@
 """CLI.
 
-  harness run   --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
-  harness tools [--tools mod] [--filter kw]
-  harness trace <run_id> [--step N | --summary]
+  harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
+  harness resume <run_id> --endpoint http://host:port/v1 [--step-cap N]
+  harness tools  [--tools mod] [--filter kw]
+  harness trace  <run_id> [--step N | --summary]
   harness replay <run_id> [--workdir d] [--tools mod]
 
-Exit codes for run: 0 completed, 1 blocked/failed, 2 transport_error,
-3 step_cap, 4 stalled. For replay: 0 identical to the recording, 1 drifted.
-A bad command line (no task, unloadable --tools) is 64; an unreadable run
-directory is 66.
+Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
+transport_error, 3 step_cap, 4 stalled. For replay: 0 identical to the
+recording, 1 drifted. A bad command line (no task, unloadable --tools, a run
+that cannot be resumed) is 64; an unreadable run directory is 66.
 """
 from __future__ import annotations
 
@@ -21,11 +22,12 @@ from pathlib import Path
 from .plugins import PluginError, load_all
 from .registry import ToolRegistry
 from .replay import compare
-from .runtime import AgentRuntime, RuntimeConfig
+from .resume import prepare as prepare_resume
+from .runtime import AgentRuntime, ResumeError, RuntimeConfig
 from .tools import register_default_tools
 from .trajectory import format_summary, format_trace, read_trajectory
 from .replay import replay as replay_run
-from .transport import ChatCompletionsTransport
+from .transport import ChatCompletionsTransport, Transport
 
 EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3, "stalled": 4}
 USAGE_ERROR = 64
@@ -47,6 +49,17 @@ def _extra_body(raw: str | None) -> dict:
     if reserved:
         raise ValueError(f"--extra-body may not set {', '.join(reserved)}; the harness owns those fields")
     return value
+
+
+def _transport(a: argparse.Namespace) -> Transport:
+    """The provider adapter a run or resume will talk to. Raises ValueError on
+    a bad --extra-body."""
+    return ChatCompletionsTransport(
+        endpoint=a.endpoint,
+        api_key=a.api_key or os.environ.get("HARNESS_API_KEY"),
+        timeout=a.timeout,
+        extra=_extra_body(a.extra_body),
+    )
 
 
 def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
@@ -76,17 +89,11 @@ def _run(a: argparse.Namespace) -> int:
         print(f"run: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
     try:
-        extra = _extra_body(a.extra_body)
+        transport = _transport(a)
     except ValueError as e:
         print(f"run: {e}", file=sys.stderr)
         return USAGE_ERROR
 
-    transport = ChatCompletionsTransport(
-        endpoint=a.endpoint,
-        api_key=a.api_key or os.environ.get("HARNESS_API_KEY"),
-        timeout=a.timeout,
-        extra=extra,
-    )
     cfg = RuntimeConfig(
         step_cap=a.step_cap,
         require_todos=not a.no_todo_gate,
@@ -97,6 +104,38 @@ def _run(a: argparse.Namespace) -> int:
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, run_id=a.run_id)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
     res = rt.run(task)
+    print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
+    if res.final:
+        print(res.final.get("content", ""))
+    return EXIT.get(res.status, 1)
+
+
+def _resume(a: argparse.Namespace) -> int:
+    run_dir = Path(a.runs_dir) / a.run_id
+    workdir = Path(a.workdir).resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        registry = _registry(a, workdir)
+    except PluginError as e:
+        print(f"resume: --tools {e}", file=sys.stderr)
+        return USAGE_ERROR
+    try:
+        transport = _transport(a)
+    except ValueError as e:
+        print(f"resume: {e}", file=sys.stderr)
+        return USAGE_ERROR
+
+    try:
+        rt, detail = prepare_resume(run_dir, registry, transport, model=a.model, step_cap=a.step_cap)
+        print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
+              file=sys.stderr)
+        res = rt.resume(detail)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 66
+    except ResumeError as e:
+        print(f"resume: {e}", file=sys.stderr)
+        return USAGE_ERROR
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
     if res.final:
         print(res.final.get("content", ""))
@@ -161,24 +200,37 @@ def build_parser() -> argparse.ArgumentParser:
     tools_help = ("module exporting `registry` or `register(registry)`; dotted name or path "
                   "to a .py file. Repeatable.")
 
+    def model_args(sp, *, model_required: bool) -> None:
+        """Everything needed to reach a provider. Shared by run and resume."""
+        sp.add_argument("--model", required=model_required, default=None,
+                        help="model id" + ("" if model_required else " (default: the one the run recorded)"))
+        sp.add_argument("--endpoint", required=True,
+                        help="OpenAI-compatible base URL, e.g. http://localhost:8080/v1")
+        sp.add_argument("--api-key", default=None, help="or set HARNESS_API_KEY")
+        sp.add_argument("--timeout", type=float, default=120.0)
+        sp.add_argument("--extra-body", default=None, metavar="JSON",
+                        help='extra provider request parameters, e.g. \'{"temperature": 0}\'')
+        sp.add_argument("--workdir", default=".", help="root for fs_* and run_shell tools")
+        sp.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
+
     r = sub.add_parser("run", help="run a task")
     r.add_argument("--task")
     r.add_argument("--task-file")
-    r.add_argument("--model", required=True)
-    r.add_argument("--endpoint", required=True, help="OpenAI-compatible base URL, e.g. http://localhost:8080/v1")
-    r.add_argument("--api-key", default=None, help="or set HARNESS_API_KEY")
-    r.add_argument("--workdir", default=".", help="root for fs_* and run_shell tools")
-    r.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
+    model_args(r, model_required=True)
     r.add_argument("--run-id", default=None)
     r.add_argument("--step-cap", type=int, default=250)
     r.add_argument("--no-todo-gate", action="store_true")
     r.add_argument("--result-chars", type=int, default=2000)
     r.add_argument("--context-chars", type=int, default=60000)
     r.add_argument("--preview-chars", type=int, default=400)
-    r.add_argument("--timeout", type=float, default=120.0)
-    r.add_argument("--extra-body", default=None, metavar="JSON",
-                   help='extra provider request parameters, e.g. \'{"temperature": 0}\'')
     r.set_defaults(fn=_run)
+
+    rs = sub.add_parser("resume", help="continue an interrupted run (transport_error, step_cap, stalled)")
+    rs.add_argument("run_id")
+    model_args(rs, model_required=False)
+    rs.add_argument("--step-cap", type=int, default=None,
+                    help="raise the cap for the rest of the run (default: the cap it ran under)")
+    rs.set_defaults(fn=_resume)
 
     l = sub.add_parser("tools", help="list registered tools (what the agent can discover)")
     l.add_argument("--workdir", default=".", help="root the fs_* tools would be given")

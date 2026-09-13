@@ -13,7 +13,9 @@ return shows up as a difference in the new trajectory.
     assert compare("runs/20240101-120000-abc123", result.run_dir) == []
 
 Timing, ids and the artifact bodies are not compared; everything the model or
-the tools decided is.
+the tools decided is. A recording that was resumed replays as one straight
+run - the turns of every segment in order, under the configuration the last
+segment ended with - so its footer is compared against the recording's last.
 """
 from __future__ import annotations
 
@@ -22,8 +24,8 @@ from pathlib import Path
 from typing import Any
 
 from .registry import ToolRegistry
-from .runtime import AgentRuntime, RunResult, RuntimeConfig
-from .trajectory import read_trajectory
+from .runtime import AgentRuntime, RunResult, RuntimeConfig, effective_config
+from .trajectory import last, read_trajectory
 from .transport import TransportError, public_messages
 
 COMPARED_FIELDS = ("step", "call_index", "reasoning", "tool", "args", "kind",
@@ -62,7 +64,7 @@ class ReplayTransport:
     def __init__(self, source: Any) -> None:
         self.records = _records(source)
         self.header = next((r for r in self.records if r.get("type") == "header"), {})
-        self.footer = next((r for r in self.records if r.get("type") == "footer"), {})
+        self.footer = last(self.records, "footer")
         self.turns = turns_from_trajectory(self.records)
         self.requests: list[dict] = []
         self.index = 0
@@ -77,13 +79,14 @@ class ReplayTransport:
 
     @property
     def model(self) -> str:
-        return self.header.get("model") or "replay"
+        return (last(self.records, "resume") or self.header).get("model") or "replay"
 
     @property
     def config(self) -> RuntimeConfig:
-        """The recorded run's config, as far as this version of the harness understands it."""
-        known = set(RuntimeConfig.__dataclass_fields__)
-        return RuntimeConfig(**{k: v for k, v in (self.header.get("config") or {}).items() if k in known})
+        """The config the recording ended under, as far as this version of the
+        harness understands it. A resumed recording may have raised the step
+        cap; replaying under the original cap would stop short of the tape."""
+        return effective_config(self.records)
 
     def complete(self, messages: list[dict], tools: list[dict], model: str) -> dict:
         self.requests.append({"messages": public_messages(messages), "tools": tools, "model": model})
@@ -142,8 +145,7 @@ def compare(original: Any, replayed: Any, fields: tuple = COMPARED_FIELDS) -> li
         for field in fields:
             if ra.get(field) != rb.get(field):
                 diffs.append(_describe(ra.get("step"), field, ra.get(field), rb.get(field)))
-    fa = next((r for r in _records(original) if r.get("type") == "footer"), {})
-    fb = next((r for r in _records(replayed) if r.get("type") == "footer"), {})
+    fa, fb = last(_records(original), "footer"), last(_records(replayed), "footer")
     for field in ("status", "steps", "final"):
         if fa.get(field) != fb.get(field):
             diffs.append(f"footer {field}: recorded {_short(fa.get(field))} != replayed {_short(fb.get(field))}")

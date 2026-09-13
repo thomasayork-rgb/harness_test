@@ -1,0 +1,80 @@
+"""Resume an interrupted run.
+
+A run that ended with ``transport_error``, ``step_cap`` or ``stalled`` stopped
+for a reason outside the task: the endpoint fell over, the budget ran out, the
+model went quiet. Everything needed to carry on is already on disk - the
+conversation and tool state in ``state.json``, the configuration in the
+trajectory header - so resuming is rebuilding the runtime around that state and
+calling ``resume()`` instead of ``run()``::
+
+    from harness.resume import resume
+
+    result = resume("runs/20240101-120000-abc123", registry, transport, step_cap=400)
+
+The run keeps its id, its directory, and its trajectory: the new segment is
+appended after a ``resume`` record and the step counter carries on. Statuses
+that are answers rather than interruptions (``completed``, ``blocked``,
+``failed``) are refused, as is a run some other process still has open
+(``running``).
+"""
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from .registry import ToolRegistry
+from .runtime import (RESUMABLE, AgentRuntime, ResumeError, RunResult, RunState,
+                      effective_config)
+from .trajectory import last, read_trajectory
+from .transport import Transport
+
+
+def load(run_dir: Any) -> tuple[RunState, list[dict]]:
+    """``(state, records)`` for a run directory. Raises FileNotFoundError if
+    either half of the run is missing, ResumeError if the state is unreadable."""
+    path = Path(run_dir)
+    state_path = path / "state.json"
+    records = read_trajectory(path)
+    if not state_path.exists():
+        raise FileNotFoundError(f"no state at {state_path}")
+    try:
+        return RunState.load(state_path), records
+    except (ValueError, TypeError) as e:
+        raise ResumeError(f"{state_path}: cannot read run state: {e}") from None
+
+
+def prepare(
+    run_dir: Any,
+    registry: ToolRegistry,
+    transport: Transport,
+    *,
+    model: str | None = None,
+    step_cap: int | None = None,
+) -> tuple[AgentRuntime, str | None]:
+    """Rebuild the runtime for a resumable run. Returns it with the detail of
+    the footer that closed the previous segment, for ``AgentRuntime.resume``."""
+    path = Path(run_dir)
+    state, records = load(path)
+    if state.status not in RESUMABLE:
+        raise ResumeError(
+            f"run {state.run_id} ended with status '{state.status}'; only "
+            f"{', '.join(RESUMABLE)} can be resumed")
+    config = effective_config(records)
+    if step_cap is not None:
+        config.step_cap = step_cap
+    runtime = AgentRuntime(registry, transport, path.parent, model or state.model, config,
+                           run_id=path.name, state=state)
+    return runtime, last(records, "footer").get("detail")
+
+
+def resume(
+    run_dir: Any,
+    registry: ToolRegistry,
+    transport: Transport,
+    *,
+    model: str | None = None,
+    step_cap: int | None = None,
+) -> RunResult:
+    """Continue a run in place. The trajectory grows; it is not replaced."""
+    runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap)
+    return runtime.resume(detail)

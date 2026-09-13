@@ -9,6 +9,16 @@ One JSONL file per run. Record types:
             call_index: the position of this call in its model turn, so turn
             boundaries survive the round trip (see harness.replay)
   footer  - terminal status, step count, final answer
+  resume  - a seam between two segments of the same run: what the previous
+            segment ended with, and the model and config the next one starts
+            with (see harness.resume)
+
+A resumed run appends to the same file, so the shape is
+
+    header  step*  footer  [resume  step*  footer]*
+
+with one footer per segment and the step counter running straight through.
+The last footer is the run's current answer; the earlier ones are history.
 
 Full tool results are written to ``artifacts/`` beside the JSONL so
 ``trace --step N`` can show the whole thing without bloating the log.
@@ -97,6 +107,22 @@ class TrajectoryWriter:
             "todo_snapshot": todo_snapshot,
         })
 
+    def resume(self, *, run_id: str, model: str, from_status: str, from_step: int,
+               from_detail: str | None, step_cap: int, config: dict, note: str) -> None:
+        self._write({
+            "type": "resume",
+            "run_id": run_id,
+            "ts": _now(),
+            "harness_version": HARNESS_VERSION,
+            "model": model,
+            "from_status": from_status,
+            "from_step": from_step,
+            "from_detail": from_detail,
+            "step_cap": step_cap,
+            "config": config,
+            "note": note,
+        })
+
     def footer(self, *, run_id: str, status: str, steps: int, final: dict | None, detail: str | None = None) -> None:
         self._write({
             "type": "footer",
@@ -129,10 +155,45 @@ def _epoch(ts: str | None) -> float | None:
         return None
 
 
+def last(records: list[dict], type_: str) -> dict:
+    """The last record of a type, or {}. A resumed run has one footer per
+    segment; the last one is the run's current answer."""
+    for rec in reversed(records):
+        if rec.get("type") == type_:
+            return rec
+    return {}
+
+
+def _wall_seconds(records: list[dict]) -> float | None:
+    """Seconds inside segments: header/resume to the footer that closed it.
+
+    Summing per segment rather than first-to-last keeps the time a run sat
+    waiting to be resumed out of the number.
+    """
+    total = 0.0
+    start: float | None = None
+    seen = False
+    for rec in records:
+        if rec.get("type") in ("header", "resume"):
+            start = _epoch(rec.get("ts"))
+        elif rec.get("type") == "footer" and start is not None:
+            end = _epoch(rec.get("ts"))
+            if end is None:
+                return None
+            total += end - start
+            start, seen = None, True
+    return round(total, 1) if seen else None
+
+
 def summarize(records: list[dict]) -> dict:
-    """Run stats from the JSONL: status, step kinds, per-tool counts, tokens, elapsed."""
+    """Run stats from the JSONL: status, step kinds, per-tool counts, tokens, elapsed.
+
+    Segment-aware: a resumed run is summarised as one run, with the totals
+    covering every segment and the status taken from the last footer.
+    """
     header = next((r for r in records if r["type"] == "header"), None) or {}
-    footer = next((r for r in records if r["type"] == "footer"), None) or {}
+    footer = last(records, "footer")
+    resumes = [r for r in records if r.get("type") == "resume"]
     steps = [r for r in records if r["type"] == "step"]
 
     kinds: dict[str, int] = {}
@@ -146,13 +207,14 @@ def summarize(records: list[dict]) -> dict:
         tokens_out += r.get("tokens_out") or 0
         elapsed_ms += r.get("elapsed_ms") or 0
 
-    start, end = _epoch(header.get("ts")), _epoch(footer.get("ts"))
     return {
         "run_id": header.get("run_id") or footer.get("run_id"),
-        "model": header.get("model"),
+        "model": (resumes[-1] if resumes else header).get("model"),
         "harness_version": header.get("harness_version"),
         "task": header.get("task"),
-        "step_cap": header.get("step_cap"),
+        "step_cap": (resumes[-1] if resumes else header).get("step_cap"),
+        "segments": 1 + len(resumes),
+        "resumed_from": [r.get("from_status") for r in resumes],
         "status": footer.get("status", "incomplete"),
         "detail": footer.get("detail"),
         "steps": footer.get("steps", len(steps)),
@@ -160,12 +222,13 @@ def summarize(records: list[dict]) -> dict:
         "kinds": dict(sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
         "tools": dict(sorted(tools.items(), key=lambda kv: (-kv[1], kv[0]))),
         "errors": kinds.get("error", 0),
+        "denied": kinds.get("denied", 0),
         "rejected_finals": kinds.get("final_rejected", 0),
         "text_only": kinds.get("text_only", 0),
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
         "elapsed_ms": elapsed_ms,
-        "wall_s": None if start is None or end is None else round(end - start, 1),
+        "wall_s": _wall_seconds(records),
     }
 
 
@@ -175,11 +238,14 @@ def format_summary(records: list[dict]) -> str:
     lines = [f"run {s['run_id']}  model={s['model']}  harness {s['harness_version']}  cap={s['step_cap']}"]
     if s["task"]:
         lines.append(f"task: {str(s['task'])[:200]}")
+    if s["segments"] > 1:
+        lines.append(f"segments: {s['segments']}  resumed from: {', '.join(s['resumed_from'])}")
     lines.append(f"status: {s['status']}  steps: {s['steps']}" + (f"  ({s['detail']})" if s["detail"] else ""))
     wall = "?" if s["wall_s"] is None else f"{s['wall_s']:g}"
     lines.append(f"elapsed: {s['elapsed_ms'] / 1000:.1f} s in steps, {wall} s wall")
     lines.append(f"tokens: {s['tokens_in']} in / {s['tokens_out']} out")
-    lines.append(f"errors: {s['errors']}  rejected finals: {s['rejected_finals']}  text-only turns: {s['text_only']}")
+    lines.append(f"errors: {s['errors']}  rejected finals: {s['rejected_finals']}  "
+                 f"text-only turns: {s['text_only']}  denied: {s['denied']}")
     lines.append("kinds: " + (", ".join(f"{k} {n}" for k, n in s["kinds"].items()) or "(none)"))
     lines.append("tools:")
     width = max((len(t) for t in s["tools"]), default=0)
@@ -195,8 +261,6 @@ def format_summary(records: list[dict]) -> str:
 def format_trace(records: list[dict], run_dir: Path, step: int | None = None) -> str:
     """Readable trace. With ``step`` set, print that step in full (artifact included)."""
     lines: list[str] = []
-    header = next((r for r in records if r["type"] == "header"), None)
-    footer = next((r for r in records if r["type"] == "footer"), None)
     steps = [r for r in records if r["type"] == "step"]
 
     if step is not None:
@@ -224,19 +288,28 @@ def format_trace(records: list[dict], run_dir: Path, step: int | None = None) ->
             lines.append(f"  [{t['status']}] {t['id']}: {t['content']}")
         return "\n".join(lines)
 
-    if header:
-        lines.append(f"run {header['run_id']}  model={header['model']}  cap={header['step_cap']}  {header['ts']}")
-        lines.append(f"task: {header['task'][:200]}")
-        lines.append("")
-    for rec in steps:
-        tool = rec["tool"] or "(text only)"
-        reasoning = (rec["reasoning"] or "").strip().replace("\n", " ")
-        if len(reasoning) > 160:
-            reasoning = reasoning[:157] + "..."
-        lines.append(f"{rec['step']:>4}  {rec['kind']:<15} {tool:<22} {rec['elapsed_ms']:>6} ms  {reasoning}")
-    if footer:
-        lines.append("")
-        lines.append(f"status: {footer['status']}  steps: {footer['steps']}" + (f"  ({footer['detail']})" if footer.get("detail") else ""))
-        if footer.get("final"):
-            lines.append(f"final [{footer['final'].get('status')}]: {str(footer['final'].get('content'))[:500]}")
+    # In file order, so the seams of a resumed run appear where they happened.
+    for rec in records:
+        kind = rec.get("type")
+        if kind == "header":
+            lines.append(f"run {rec['run_id']}  model={rec['model']}  cap={rec['step_cap']}  {rec['ts']}")
+            lines.append(f"task: {rec['task'][:200]}")
+            lines.append("")
+        elif kind == "step":
+            tool = rec["tool"] or "(text only)"
+            reasoning = (rec["reasoning"] or "").strip().replace("\n", " ")
+            if len(reasoning) > 160:
+                reasoning = reasoning[:157] + "..."
+            lines.append(f"{rec['step']:>4}  {rec['kind']:<15} {tool:<22} {rec['elapsed_ms']:>6} ms  {reasoning}")
+        elif kind == "footer":
+            lines.append("")
+            lines.append(f"status: {rec['status']}  steps: {rec['steps']}"
+                         + (f"  ({rec['detail']})" if rec.get("detail") else ""))
+            if rec.get("final"):
+                lines.append(f"final [{rec['final'].get('status')}]: {str(rec['final'].get('content'))[:500]}")
+        elif kind == "resume":
+            lines.append("")
+            lines.append(f"-- resumed at step {rec['from_step']} after {rec['from_status']}"
+                         f"  model={rec['model']}  cap={rec['step_cap']}  {rec['ts']}")
+            lines.append("")
     return "\n".join(lines)
