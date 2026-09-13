@@ -75,7 +75,9 @@ python -m harness --runs-dir RUNS trace RUN_ID --step 7     # one step in full, 
 python -m harness --runs-dir RUNS trace RUN_ID --summary    # status, kinds, per-tool counts, tokens
 python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N]  # after transport_error, step_cap, stalled
 python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
+python -m harness --runs-dir RUNS bench TASKS.jsonl ...     # a file of tasks, one table, bench.jsonl
 python -m harness tools [--tools SPEC]                      # what the agent can discover
+python -m harness prompt [--sources]                        # the system prompt a run would start with
 ```
 
 `--runs-dir` is a global option and goes **before** the subcommand. `resume` defaults `--endpoint`, `--provider`, `--workdir`, `--tools`, `--extra-body`, `--max-tokens`, `--timeout` and the policy to what the run recorded in its trajectory header (`invocation`); an explicit flag overrides. The API key is never recorded, and prompt flags are refused. Replaying a run that edited files needs a pristine workdir. For experiments, point `--runs-dir` and `--workdir` at scratch space, never at the repo.
@@ -100,8 +102,9 @@ harness/
   plugins.py       --tools loading
   mockserver.py    MockOpenAIServer, MockAnthropicServer for tests
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
-  prompts.py       system prompt and nudge
-  cli.py           run / resume / tools / trace / replay
+  prompts.py       prompt layers (built-in, global file, appends) and the nudge
+  cli.py           run / resume / bench / tools / prompt / trace / replay
   tools/           paths.py (rooting), basic.py, search.py, edit.py, scratch.py
+examples/          global-system.md: an example global prompt
 tests/             one module per area; the *_http and anthropic tests are the only real-HTTP tests
 ```

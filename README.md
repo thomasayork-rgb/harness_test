@@ -7,7 +7,7 @@ A minimal ReAct agent runtime with four guarantees the loop enforces, not the pr
 3. **Think-before-act.** The assistant's text on each tool-calling turn is captured as that step's `reasoning`. No retry if it's empty. Private reasoning channels are never read.
 4. **Trajectory export.** One JSONL per run: header, one record per tool call (discovery and todo calls included), footer. Full tool results go to `artifacts/`; the JSONL carries a preview. `harness trace` reads it back.
 
-Plus a context budget so a local model survives a 60-step run: per-result truncation in context, oldest-result eviction past a total budget, reasoning and todo state never evicted.
+Plus a context budget so a local model survives a 60-step run: per-result truncation in context, oldest-result eviction past a total budget; reasoning, todo state and the results of the turn in flight are never evicted.
 
 Zero dependencies. Python 3.10+. Talks to any OpenAI-compatible `/v1/chat/completions` endpoint (llama.cpp server, vLLM, LM Studio, Ollama, or the real thing), or to the Anthropic Messages API with `--provider anthropic`.
 
@@ -20,17 +20,19 @@ python -m harness run \
   --endpoint http://localhost:8080/v1 \
   --workdir ./project
 
-python -m harness resume <run_id> --endpoint http://localhost:8080/v1 --step-cap 400
+python -m harness resume <run_id> --step-cap 400        # same flags as before, from the recording
+python -m harness bench tasks.jsonl --model m --endpoint http://localhost:8080/v1
 python -m harness tools                       # what the agent can discover
+python -m harness prompt [--sources]          # the system prompt a run would start with
 python -m harness trace <run_id>              # readable trace
 python -m harness trace <run_id> --step 7     # one step in full, artifact included
 python -m harness trace <run_id> --summary    # status, kinds, per-tool counts, tokens, elapsed
 python -m harness replay <run_id> --workdir ./project   # re-run a recording against today's tools
 ```
 
-`--api-key` or `HARNESS_API_KEY` for hosted endpoints. Runs land in `./runs/<run_id>/` (`--runs-dir` to move). Exit codes for `run` and `resume`: `0` completed, `1` blocked/failed, `2` transport_error, `3` step_cap, `4` stalled. For `replay`: `0` identical to the recording, `1` drifted. A bad command line — including a run that cannot be resumed — is `64`, an unreadable run directory `66`.
+`--api-key` or `HARNESS_API_KEY` for hosted endpoints. Runs land in `./runs/<run_id>/` (`--runs-dir` to move). Exit codes for `run` and `resume`: `0` completed, `1` blocked/failed, `2` transport_error, `3` step_cap, `4` stalled. For `replay`: `0` identical to the recording, `1` drifted. For `bench`: `0` if every task completed, `1` otherwise. A bad command line — including a run that cannot be resumed — is `64`, an unreadable run directory `66`.
 
-Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable).
+Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
 
 ## Run directory
 
@@ -42,7 +44,7 @@ runs/<run_id>/
   scratch/             notes the agent wrote with scratch_write
 ```
 
-Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step. The header records the `config` the run started under and the `policy` in force, or `null`.
+Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, and `invocation`: the endpoint, provider, workdir, `--tools` modules and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
 
 ## Failure semantics
 
@@ -62,10 +64,10 @@ All of it is visible in the trajectory. When a turn is cut short — the cap tri
 ## Resume
 
 ```bash
-python -m harness resume <run_id> --endpoint http://localhost:8080/v1 [--step-cap 400]
+python -m harness resume <run_id> [--step-cap 400]
 ```
 
-Continues a run that ended with `transport_error`, `step_cap` or `stalled`. `completed`, `blocked` and `failed` are answers, not interruptions, and `running` means another process still owns the run: all four are refused with exit `64`. The run keeps its id, its directory and its step counter; `state.json` supplies the conversation, the active tools and the todos, and the trajectory header supplies the config (`--step-cap` raises the cap, and must, if the run is already at it). `--model` defaults to the one the run recorded; `--tools`, `--provider` and the policy flags are given again, since they are not recorded state.
+Continues a run that ended with `transport_error`, `step_cap` or `stalled`. `completed`, `blocked` and `failed` are answers, not interruptions, and `running` means another process still owns the run: all four are refused with exit `64`. The run keeps its id, its directory and its step counter; `state.json` supplies the conversation, the active tools and the todos, and the trajectory header supplies the config (`--step-cap` raises the cap, and must, if the run is already at it). `--model` defaults to the one the run recorded, and `--endpoint`, `--provider`, `--workdir`, `--tools`, `--extra-body`, `--max-tokens`, `--timeout` and the policy flags default to the `invocation` and `policy` the last segment recorded, so `harness resume <run_id>` on its own continues the run as it was; an explicit flag overrides. The API key is never recorded, so `--api-key` (or `HARNESS_API_KEY`) is given again. Prompt flags are refused with exit `64`: the system prompt is part of the conversation in `state.json` and is never re-resolved.
 
 The trajectory is appended to, never replaced:
 
@@ -73,7 +75,7 @@ The trajectory is appended to, never replaced:
 header  step*  footer  [resume  step*  footer]*
 ```
 
-One footer per segment — each says how that segment ended — with a `resume` record between segments carrying `from_status`, `from_step`, `from_detail`, and the `model`, `step_cap`, `config` and `policy` the next segment runs under. The last footer is the run's answer; earlier ones are history. `read_trajectory` returns the lot; `summarize` totals every segment and reads its status from the last footer (plus `segments` and `resumed_from`, and wall time summed per segment so the hours a run sat waiting are not counted); `format_trace` prints the seam where it happened; `ReplayTransport` reads a resumed recording as one straight run under the configuration the last segment ended with, so a raised cap replays as a raised cap.
+One footer per segment — each says how that segment ended — with a `resume` record between segments carrying `from_status`, `from_step`, `from_detail`, and the `model`, `step_cap`, `config`, `policy` and `invocation` the next segment runs under — so the segment after that defaults to them in turn. The last footer is the run's answer; earlier ones are history. `read_trajectory` returns the lot; `summarize` totals every segment and reads its status from the last footer (plus `segments` and `resumed_from`, and wall time summed per segment so the hours a run sat waiting are not counted); `format_trace` prints the seam where it happened; `ReplayTransport` reads a resumed recording as one straight run under the configuration the last segment ended with, so a raised cap replays as a raised cap.
 
 Resuming appends one user message saying what happened, which also leaves the transcript ending on a user turn however the segment died. From Python:
 
@@ -81,6 +83,63 @@ Resuming appends one user message saying what happened, which also leaves the tr
 from harness.resume import resume
 result = resume("runs/20240101-120000-abc123", registry, transport, step_cap=400)
 ```
+
+## System prompt
+
+Three layers, joined with a blank line:
+
+| layer | where it comes from |
+|---|---|
+| base | the built-in prompt, or `--system-prompt FILE` instead of it |
+| global | the first of `$HARNESS_SYSTEM_PROMPT`, `$XDG_CONFIG_HOME/harness/system.md`, `~/.config/harness/system.md` that exists — unless `--no-global-prompt` |
+| append | each `--append-system-prompt FILE`, in the order given |
+
+The built-in prompt teaches the mechanics the loop enforces (discovery, the todo gate, think-before-act, reading
+errors, denials, eviction and the scratch pad, the file-tool patterns, what `final_answer.content` is for) and
+nothing about your house. House rules — never run destructive shell commands, prefer `fs_edit` over `fs_write`,
+report paths relative to the workdir — belong in the global prompt, which applies to every run on the machine.
+`examples/global-system.md` is one to copy to `~/.config/harness/system.md` and edit. Only the first existing
+location is used; a machine has one set of house rules, not three.
+
+```bash
+python -m harness prompt                      # the effective prompt for these flags
+python -m harness prompt --sources            # where each layer came from, and how big it is
+python -m harness run --append-system-prompt ./task-notes.md ...
+```
+
+```
+base    builtin  2567 chars
+global  /home/you/.config/harness/system.md  941 chars
+total: 3510 chars
+```
+
+A file that is named and cannot be read is a usage error (exit `64`), never a silently missing layer. The layers
+are recorded in the trajectory header as `prompt_sources` — `{"source": "builtin" | "<path>", "role": "base" |
+"global" | "append", "chars": n}` — and printed by `trace` and `trace --summary`, so a trace says what the model
+was told and not just what it did. A resumed run replays the system message in `state.json` and never re-reads a
+file, which is why prompt flags on `resume` are refused rather than quietly ignored.
+
+## Benchmarks
+
+```bash
+python -m harness bench tasks.jsonl --model m --endpoint http://localhost:8080/v1 --step-cap 60
+```
+
+One task per JSONL line — `{"task": "...", "workdir": "...", "run_id": "..."}`, the last two optional — run
+sequentially under the same flags as `run` (`--workdir` is the default for lines without one). Each task is an
+ordinary run with its own run directory, so a task that dies can be resumed, traced and replayed like any other.
+
+```
+run id                  status     steps  tokens in  tokens out  elapsed
+20240101-120000-a1b2c3  completed      7       4200         310    8.4 s
+20240101-120009-d4e5f6  step_cap      60      51000        2400   77.1 s
+
+2 task(s): 1 completed, 1 not (step_cap)
+```
+
+A row per task is appended to `bench.jsonl` next to the run directories: `run_id, task, workdir, status, steps,
+tokens_in, tokens_out, elapsed_ms, wall_s, errors, denied, final`. Exit `0` if every task completed, `1`
+otherwise.
 
 ## Built-in tools
 
@@ -97,7 +156,7 @@ result = resume("runs/20240101-120000-abc123", registry, transport, step_cap=400
 
 The `fs_*` tools are rooted to `--workdir`: a path that resolves outside it is refused, never clamped. `run_shell` starts there but is not a sandbox — a shell command can still walk out, which is what `--deny-shell-pattern` is for. `fs_search` and `fs_glob` skip binary files, files over 2 MB, and `.git`/cache/vendor directories. `harness tools [--filter kw]` prints the list the agent would see.
 
-The scratch pad is per run, not per workdir: `scratch_write` saves a short note under `runs/<run_id>/scratch/`, and `scratch_read` gets it back whatever the context budget did in between. The *result* of a scratch call is an ordinary tool result — truncated and evictable like any other — but the note on disk is not, so an agent that writes down what it found can still answer for it forty steps later. Notes the user should keep belong in the workdir, via `fs_write`. Because they are rooted in the run directory, the CLI registers them once the run exists; `harness replay` does not (a recording that used them replays as an unknown tool, which shows up as drift).
+The scratch pad is per run, not per workdir: `scratch_write` saves a short note under `runs/<run_id>/scratch/`, and `scratch_read` gets it back whatever the context budget did in between. The *result* of a scratch call is an ordinary tool result — truncated and evictable like any other — but the note on disk is not, so an agent that writes down what it found can still answer for it forty steps later. Notes the user should keep belong in the workdir, via `fs_write`. Because they are rooted in the run directory, the CLI registers them once the run exists, and `harness replay` registers a pad in the replay's own run directory, so a recording that took notes replays as a run that takes notes.
 
 ## Add tools
 
@@ -164,7 +223,7 @@ A denial is not an error — the tool did not fail, it never ran — so it gets 
 python -m harness run --deny-tool fs_edit --deny-shell-pattern 'rm\s+-rf' --deny-shell-pattern '\bcurl\b' ...
 ```
 
-Tool names are matched exactly; shell patterns are Python regexes searched against the `command` argument of `run_shell`. A policy is not part of a recording: `replay(..., policy=...)` re-applies one, otherwise a call the original run denied runs for real and the comparison reports drift.
+Tool names are matched exactly; shell patterns are Python regexes searched against the `command` argument of `run_shell`. A policy is part of a recording: `replay` rebuilds the one the header describes, so a denied call stays denied instead of running for real and dragging every later step into drift. `replay(..., policy=...)` and `harness replay --deny-tool ...` replay under different rules; `policy=ToolPolicy()` under none.
 
 ## Replay and the mock server
 
@@ -201,7 +260,7 @@ python -m pytest -q
 
 `tests/test_runtime.py::test_scripted_end_to_end_matches_jsonl_step_for_step` drives a fake transport through list → add → inspect → todo → rejected final → close → accepted final and asserts the JSONL step for step. Use `harness.transport.FakeTransport` the same way to test your own tools without a model.
 
-`tests/test_e2e_http.py` runs `python -m harness run` as a subprocess against the mock server and asserts the exit code, the run directory, the trajectory, the artifacts, and the guarantees on the wire. `tests/test_tools_fs.py` exercises each file tool through the runtime, error paths included; `tests/test_plugins.py` covers `--tools`; `tests/test_replay.py` records a run, replays it, and asserts the trajectories match step for step; `tests/test_resume.py` caps a run, kills one with a transport error, stalls one, resumes each and checks the seams; `tests/test_anthropic.py` asserts the Messages API wire format request by request; `tests/test_policy.py` and `tests/test_scratch.py` drive the denials and the pad through the runtime.
+`tests/test_e2e_http.py` runs `python -m harness run` as a subprocess against the mock server and asserts the exit code, the run directory, the trajectory, the artifacts, and the guarantees on the wire. `tests/test_tools_fs.py` exercises each file tool through the runtime, error paths included; `tests/test_plugins.py` covers `--tools`; `tests/test_replay.py` records a run, replays it, and asserts the trajectories match step for step; `tests/test_resume.py` caps a run, kills one with a transport error, stalls one, resumes each and checks the seams; `tests/test_anthropic.py` asserts the Messages API wire format request by request; `tests/test_policy.py` and `tests/test_scratch.py` drive the denials and the pad through the runtime; `tests/test_prompts.py` covers the prompt layers, the provenance and `harness prompt` (with `HOME`, `XDG_CONFIG_HOME` and `HARNESS_SYSTEM_PROMPT` pointed at temporary directories, never the real ones); `tests/test_bench.py` benches two tasks over the mock server.
 
 ## Layout
 
@@ -219,12 +278,14 @@ harness/
   mockserver.py    MockOpenAIServer, MockAnthropicServer (scripted, stdlib http.server)
   plugins.py       --tools module loading
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
-  prompts.py       system prompt
-  cli.py           run / resume / tools / trace / replay
+  prompts.py       the prompt layers: built-in, global file, appends
+  cli.py           run / resume / bench / tools / prompt / trace / replay
   tools/basic.py   fs_list, fs_read, fs_write, run_shell (rooted to --workdir)
   tools/search.py  fs_search, fs_glob
   tools/edit.py    fs_edit
   tools/scratch.py scratch_write, scratch_read, scratch_list (rooted to the run dir)
   tools/paths.py   workdir rooting and the directory skip list
+examples/
+  global-system.md an example global prompt: house rules for every run
 tests/
 ```
