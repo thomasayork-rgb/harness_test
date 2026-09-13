@@ -68,6 +68,14 @@ class ToolRegistry:
 
         return wrap
 
+    def merge(self, other: "ToolRegistry") -> list[str]:
+        """Copy another registry's tools in. A duplicate name is an error."""
+        for name in other.names():
+            spec = other.get(name)
+            if spec is not None:
+                self.register(spec)
+        return other.names()
+
     def get(self, name: str) -> ToolSpec | None:
         return self._tools.get(name)
 
