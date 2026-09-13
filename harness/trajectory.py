@@ -186,6 +186,16 @@ def last(records: list[dict], type_: str) -> dict:
     return {}
 
 
+def setting(records: list[dict], key: str, default: Any = None) -> Any:
+    """The value a trajectory ended under for a header/resume field. A resumed
+    run records its own settings at the seam, so the last segment wins."""
+    value = default
+    for rec in records:
+        if rec.get("type") in ("header", "resume") and key in rec:
+            value = rec[key]
+    return value
+
+
 def _wall_seconds(records: list[dict]) -> float | None:
     """Seconds inside segments: header/resume to the footer that closed it.
 

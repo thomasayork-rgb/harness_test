@@ -2,6 +2,7 @@
 import json
 
 from harness.cli import main
+from harness.mockserver import MockOpenAIServer
 from harness.registry import ToolRegistry
 from harness.replay import ReplayTransport, compare, replay, turns_from_trajectory
 from harness.runtime import AgentRuntime, RuntimeConfig
@@ -138,3 +139,48 @@ def test_replay_running_out_of_recorded_turns_is_a_transport_error(tmp_path):
     assert res.status == "transport_error"
     assert read_trajectory(res.run_dir)[-1]["detail"] == "replay exhausted after 3 recorded turn(s)"
     assert transport.config.preview_chars == 300  # config came back out of the header
+
+
+SCRATCH_AND_DENIAL = [
+    {"content": "Activating the pad and the shell.",
+     "tool_calls": [call("toolbelt_add", {"names": ["scratch_write", "scratch_read", "run_shell"]})]},
+    {"content": "Planning.", "tool_calls": [call("todo_write", {"todos": [
+        {"id": "1", "content": "note the port", "status": "in_progress"}]})]},
+    {"content": "Writing the finding down before it is evicted.",
+     "tool_calls": [call("scratch_write", {"name": "findings", "content": "PORT=8080"})]},
+    {"content": "Trying a command the policy forbids.",
+     "tool_calls": [call("run_shell", {"command": "echo boom"})]},
+    {"content": "Reading the note back.", "tool_calls": [call("scratch_read", {"name": "findings"})]},
+    {"content": "Closing.", "tool_calls": [call("todo_write", {"todos": [
+        {"id": "1", "content": "note the port", "status": "completed"}]})]},
+    {"content": "Finishing.", "tool_calls": [call("final_answer", {"status": "completed", "content": "8080"})]},
+]
+
+
+def test_replay_keeps_the_scratch_pad_and_the_recorded_policy(tmp_path, capsys):
+    """A recording that used the pad or hit a denial used to drift every time:
+    replay registered neither the scratch tools nor a policy."""
+    work, runs = workdir(tmp_path), tmp_path / "runs"
+    with MockOpenAIServer(SCRATCH_AND_DENIAL, model="mock-model") as server:
+        rc = main(["--runs-dir", str(runs), "run", "--task", "note the port", "--model", "mock-model",
+                   "--endpoint", server.base_url, "--workdir", str(work), "--run-id", "pad",
+                   "--deny-shell-pattern", r"\bboom\b"])
+    assert rc == 0
+    recorded = [(s["tool"], s["kind"]) for s in read_trajectory(runs / "pad") if s["type"] == "step"]
+    assert ("scratch_write", "ok") in recorded and ("run_shell", "denied") in recorded
+    assert (runs / "pad" / "scratch" / "findings").read_text(encoding="utf-8") == "PORT=8080"
+
+    rc = main(["--runs-dir", str(runs), "replay", "pad", "--workdir", str(work)])
+    out = capsys.readouterr()
+    assert rc == 0, out.out
+    assert "identical to the recording, step for step" in out.out
+    # the replay wrote to its own pad, in its own run directory
+    assert (runs / "pad-replay" / "scratch" / "findings").read_text(encoding="utf-8") == "PORT=8080"
+
+    # an explicit flag replaces the recorded policy, and the drift says so
+    rc = main(["--runs-dir", str(runs), "replay", "pad", "--workdir", str(work),
+               "--new-run-id", "loose", "--deny-tool", "scratch_read"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "step 4: kind: recorded denied != replayed ok" in out          # run_shell ran this time
+    assert "step 5: kind: recorded ok != replayed denied" in out          # and the note was refused

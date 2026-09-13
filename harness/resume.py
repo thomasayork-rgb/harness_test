@@ -27,29 +27,19 @@ from .policy import from_description
 from .registry import ToolRegistry
 from .runtime import (RESUMABLE, AgentRuntime, ResumeError, RunResult, RunState,
                       effective_config)
-from .trajectory import last, read_trajectory
+from .trajectory import last, read_trajectory, setting
 from .transport import Transport
-
-
-def _last_setting(records: list[dict], key: str, default: Any = None) -> Any:
-    """The value a trajectory ended under for a header/resume field. A resumed
-    run records its own settings at the seam, so the last segment wins."""
-    value = default
-    for rec in records:
-        if rec.get("type") in ("header", "resume") and key in rec:
-            value = rec[key]
-    return value
 
 
 def recorded_invocation(records: list[dict]) -> dict:
     """How the last segment was launched: endpoint, provider, workdir, tool
     modules, request options. ``{}`` for a run recorded before this existed."""
-    return _last_setting(records, "invocation") or {}
+    return setting(records, "invocation") or {}
 
 
 def recorded_policy(records: list[dict]) -> Any:
     """The tool-call policy the last segment ran under, rebuilt, or None."""
-    return from_description(_last_setting(records, "policy"))
+    return from_description(setting(records, "policy"))
 
 
 def load(run_dir: Any) -> tuple[RunState, list[dict]]:

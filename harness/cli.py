@@ -7,7 +7,7 @@
   harness tools  [--tools mod] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
   harness trace  <run_id> [--step N | --summary]
-  harness replay <run_id> [--workdir d] [--tools mod]
+  harness replay <run_id> [--workdir d] [--tools mod] [--deny-tool NAME]
 
 Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
 transport_error, 3 step_cap, 4 stalled. For replay: 0 identical to the
@@ -269,7 +269,13 @@ def _replay(a: argparse.Namespace) -> int:
         print(f"replay: --tools {e}", file=sys.stderr)
         return USAGE_ERROR
     try:
-        res = replay_run(source, registry, runs_dir=Path(a.runs_dir), run_id=a.new_run_id)
+        policy = _policy(a)          # no flags: the recording's own policy is used
+    except ValueError as e:
+        print(f"replay: {e}", file=sys.stderr)
+        return USAGE_ERROR
+    try:
+        res = replay_run(source, registry, runs_dir=Path(a.runs_dir), run_id=a.new_run_id,
+                         policy=policy)
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
         return 66
@@ -389,6 +395,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
     p_replay.add_argument("--new-run-id", dest="new_run_id", default=None,
                           help="run id for the replay (default: <run_id>-replay)")
+    p_replay.add_argument("--deny-tool", action="append", metavar="NAME",
+                          help="refuse this tool, replacing the recorded policy. Repeatable.")
+    p_replay.add_argument("--deny-shell-pattern", action="append", metavar="REGEX",
+                          help="refuse run_shell commands matching this regex. Repeatable.")
     p_replay.add_argument("--max-diffs", type=int, default=20)
     p_replay.set_defaults(fn=_replay)
 

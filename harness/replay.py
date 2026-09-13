@@ -23,9 +23,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .policy import from_description
 from .registry import ToolRegistry
 from .runtime import AgentRuntime, RunResult, RuntimeConfig, effective_config
-from .trajectory import last, read_trajectory
+from .tools.scratch import register_scratch_tools
+from .trajectory import last, read_trajectory, setting
 from .transport import TransportError, public_messages
 
 COMPARED_FIELDS = ("step", "call_index", "reasoning", "tool", "args", "kind",
@@ -82,6 +84,13 @@ class ReplayTransport:
         return (last(self.records, "resume") or self.header).get("model") or "replay"
 
     @property
+    def policy(self) -> Any:
+        """The tool-call policy the recording ran under, rebuilt. Without it a
+        call the original run denied would run for real, and every step after
+        it would drift."""
+        return from_description(setting(self.records, "policy"))
+
+    @property
     def config(self) -> RuntimeConfig:
         """The config the recording ended under, as far as this version of the
         harness understands it. A resumed recording may have raised the step
@@ -104,15 +113,23 @@ def replay(run_dir: Any, registry: ToolRegistry, runs_dir: Path | None = None,
            policy: Any = None) -> RunResult:
     """Re-drive a recorded run against ``registry``. Returns the new RunResult.
 
-    A tool-call policy is not part of the recording: pass one here to replay
-    under it, otherwise a call the original run denied runs for real, which the
-    comparison reports as drift.
+    The policy defaults to the one the recording ran under, so denied calls
+    stay denied instead of running for real; pass one to replay under different
+    rules, or ``ToolPolicy()`` to replay under none.
+
+    The scratch pad is registered for the replay's own run directory unless the
+    registry already has one, so a recording that wrote notes replays as a run
+    that writes notes rather than one calling an unknown tool.
     """
     transport = ReplayTransport(run_dir)
     target = Path(runs_dir) if runs_dir is not None else Path(run_dir).parent
-    return AgentRuntime(registry, transport, target, transport.model,
-                        config or transport.config, policy=policy,
-                        run_id=run_id or f"{transport.run_id}-replay").run(transport.task)
+    runtime = AgentRuntime(registry, transport, target, transport.model,
+                           config or transport.config,
+                           policy=policy if policy is not None else transport.policy,
+                           run_id=run_id or f"{transport.run_id}-replay")
+    if "scratch_write" not in registry:
+        register_scratch_tools(registry, runtime.run_dir)
+    return runtime.run(transport.task)
 
 
 def _short(value: Any, limit: int = 120) -> str:
