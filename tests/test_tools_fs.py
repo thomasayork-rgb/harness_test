@@ -58,15 +58,21 @@ def test_search_and_glob_through_the_runtime(tmp_path):
         {"content": "Capping results.",
          "tool_calls": [call("fs_search", {"pattern": "e", "max_results": 2})]},
         {"content": "Listing python files.", "tool_calls": [call("fs_glob", {"pattern": "**/*.py"})]},
+        {"content": "Globbing a path that is not there.",
+         "tool_calls": [call("fs_glob", {"pattern": "*", "path": "nope"})]},
+        {"content": "Globbing a file rather than a directory.",
+         "tool_calls": [call("fs_glob", {"pattern": "*", "path": "notes.md"})]},
         {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
     ]
     res, steps = drive(tmp_path, work, script)
     assert res.status == "completed"
     assert [s["tool"] for s in steps] == [
         "toolbelt_list", "toolbelt_add", "fs_search", "fs_search", "fs_search",
-        "fs_search", "fs_search", "fs_search", "fs_glob", "todo_write", "final_answer"]
+        "fs_search", "fs_search", "fs_search", "fs_glob", "fs_glob", "fs_glob",
+        "todo_write", "final_answer"]
     assert [s["kind"] for s in steps] == [
-        "ok", "ok", "error", "error", "error", "ok", "ok", "ok", "ok", "ok", "final_accepted"]
+        "ok", "ok", "error", "error", "error", "ok", "ok", "ok", "ok", "error", "error",
+        "ok", "final_accepted"]
 
     listed = json.loads(artifact(res, steps[0]))
     assert {"name": "fs_search", "description": listed[0]["description"]} in listed
@@ -92,6 +98,8 @@ def test_search_and_glob_through_the_runtime(tmp_path):
     globbed = json.loads(artifact(res, steps[8]))
     assert [f["path"] for f in globbed["files"]] == ["src/app.py", "src/util.py"]
     assert globbed["count"] == 2 and globbed["truncated"] is False
+    assert "no such path: nope" in steps[9]["result_preview"]
+    assert "not a directory: notes.md" in steps[10]["result_preview"]
 
 
 def test_edit_through_the_runtime(tmp_path):

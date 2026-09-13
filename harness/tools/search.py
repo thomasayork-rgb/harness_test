@@ -91,13 +91,15 @@ def register_search_tools(registry: ToolRegistry, workdir: Path) -> None:
         "Find files by glob pattern under the workdir, e.g. '**/*.py' or 'src/*.json'.\n"
         "Returns paths relative to the workdir, sorted; skips .git and cache/vendor directories.",
         {"type": "object", "properties": {
-            "pattern": {"type": "string", "description": "'*.py' matches the file name at any depth; a pattern with '/' matches the whole path"},
+            "pattern": {"type": "string", "description": "'*.py' matches the file name at any depth; a pattern with '/' matches the path relative to 'path'"},
             "path": {"type": "string", "description": "directory to search from, relative to the workdir (default '.')"},
             "max_results": {"type": "integer", "description": "default 200"},
         }, "required": ["pattern"], "additionalProperties": False},
     )
     def fs_glob(pattern: str, path: str = ".", max_results: int = 200) -> dict:
         start = resolve(path)
+        if not start.exists():
+            raise FileNotFoundError(f"no such path: {path}")
         if not start.is_dir():
             raise NotADirectoryError(f"not a directory: {path}")
         if max_results < 1:

@@ -152,3 +152,14 @@ def test_bad_tools_option_on_run_is_a_usage_error(tmp_path, capsys):
                "--endpoint", "http://127.0.0.1:1/v1", "--workdir", str(tmp_path),
                "--tools", str(tmp_path / "nothing.py")])
     assert rc == 64 and "no such file" in capsys.readouterr().err
+
+
+def test_two_plugin_files_with_the_same_name_coexist(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    first = write(tmp_path / "a", "tools.py", REGISTER_PLUGIN)
+    second = write(tmp_path / "b", "tools.py", REGISTRY_PLUGIN)
+    r = ToolRegistry()
+    assert load_all(r, [first, second], tmp_path) == ["greet", "coin_flip"]
+    assert r.get("greet").fn(name="x") == "hello x"
+    assert r.get("coin_flip").fn(seed=3) == {"seed": 3, "side": "tails"}

@@ -12,6 +12,7 @@ agent can call is exactly what the command line asked for.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -44,7 +45,9 @@ def load_module(spec: str):
     path = Path(spec).expanduser().resolve()
     if not path.is_file():
         raise PluginError(f"{spec}: no such file")
-    name = "harness_plugin_" + _SAFE.sub("_", path.stem)
+    # Two plugin files may share a stem; keep their module names distinct.
+    digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:8]
+    name = f"harness_plugin_{_SAFE.sub('_', path.stem)}_{digest}"
     module_spec = importlib.util.spec_from_file_location(name, path)
     if module_spec is None or module_spec.loader is None:
         raise PluginError(f"{spec}: not importable as a Python module")
