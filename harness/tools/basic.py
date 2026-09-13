@@ -1,0 +1,78 @@
+"""Basic tools, all rooted to a working directory. Path escapes are refused."""
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from ..registry import ToolRegistry
+
+
+def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
+    root = Path(workdir).resolve()
+
+    def resolve(rel: str) -> Path:
+        p = (root / rel).resolve()
+        if p != root and root not in p.parents:
+            raise PermissionError(f"path escapes workdir: {rel}")
+        return p
+
+    @registry.tool(
+        "fs_list",
+        "List files and directories under a path relative to the workdir.",
+        {"type": "object", "properties": {"path": {"type": "string"}, "max_entries": {"type": "integer"}},
+         "required": []},
+    )
+    def fs_list(path: str = ".", max_entries: int = 200) -> dict:
+        p = resolve(path)
+        if not p.exists():
+            raise FileNotFoundError(path)
+        if p.is_file():
+            return {"path": path, "type": "file", "bytes": p.stat().st_size}
+        entries = []
+        for child in sorted(p.iterdir()):
+            if child.name.startswith(".git"):
+                continue
+            entries.append({"name": child.name, "type": "dir" if child.is_dir() else "file",
+                            "bytes": child.stat().st_size if child.is_file() else None})
+            if len(entries) >= max_entries:
+                entries.append({"name": "...", "type": "truncated"})
+                break
+        return {"path": path, "entries": entries}
+
+    @registry.tool(
+        "fs_read",
+        "Read a text file relative to the workdir. Optional offset/limit in characters.",
+        {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"},
+                                          "limit": {"type": "integer"}},
+         "required": ["path"]},
+    )
+    def fs_read(path: str, offset: int = 0, limit: int = 20000) -> dict:
+        p = resolve(path)
+        text = p.read_text(encoding="utf-8", errors="replace")
+        return {"path": path, "total_chars": len(text), "offset": offset, "content": text[offset: offset + limit]}
+
+    @registry.tool(
+        "fs_write",
+        "Write a text file relative to the workdir. Creates parent directories. Overwrites.",
+        {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+         "required": ["path", "content"]},
+    )
+    def fs_write(path: str, content: str) -> dict:
+        p = resolve(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return {"path": path, "bytes": len(content.encode("utf-8"))}
+
+    @registry.tool(
+        "run_shell",
+        "Run a shell command in the workdir. Returns stdout, stderr, exit code. Timeout in seconds.",
+        {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}},
+         "required": ["command"]},
+    )
+    def run_shell(command: str, timeout: int = 60) -> dict:
+        try:
+            proc = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return {"command": command, "error": f"timed out after {timeout}s"}
+        return {"command": command, "exit_code": proc.returncode,
+                "stdout": proc.stdout[-20000:], "stderr": proc.stderr[-5000:]}
