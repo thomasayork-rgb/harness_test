@@ -2,8 +2,10 @@
 
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
                  [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
+                 [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
   harness resume <run_id> --endpoint http://host:port/v1 [--step-cap N]
   harness tools  [--tools mod] [--filter kw]
+  harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
   harness trace  <run_id> [--step N | --summary]
   harness replay <run_id> [--workdir d] [--tools mod]
 
@@ -23,6 +25,7 @@ from pathlib import Path
 from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
 from .plugins import PluginError, load_all
 from .policy import ToolPolicy
+from .prompts import GLOBAL_ENV, PromptError, resolve_system_prompt
 from .registry import ToolRegistry
 from .replay import compare
 from .resume import prepare as prepare_resume
@@ -72,6 +75,19 @@ def _policy(a: argparse.Namespace) -> ToolPolicy | None:
     return policy or None
 
 
+def _system_prompt(a: argparse.Namespace) -> tuple[str, list[dict]]:
+    """The effective system prompt and its provenance, for the prompt flags.
+    Raises PromptError for a file that was named and cannot be read."""
+    return resolve_system_prompt(a.system_prompt, a.append_system_prompt or [],
+                                 use_global=not a.no_global_prompt)
+
+
+def _prompt_flags_given(a: argparse.Namespace) -> list[str]:
+    return [flag for flag, value in (("--system-prompt", a.system_prompt),
+                                     ("--append-system-prompt", a.append_system_prompt),
+                                     ("--no-global-prompt", a.no_global_prompt)) if value]
+
+
 def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
     """Built-in tools plus whatever each --tools module contributes."""
     registry = ToolRegistry()
@@ -104,6 +120,11 @@ def _run(a: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"run: {e}", file=sys.stderr)
         return USAGE_ERROR
+    try:
+        system_prompt, prompt_sources = _system_prompt(a)
+    except PromptError as e:
+        print(f"run: {e}", file=sys.stderr)
+        return USAGE_ERROR
 
     cfg = RuntimeConfig(
         step_cap=a.step_cap,
@@ -112,7 +133,8 @@ def _run(a: argparse.Namespace) -> int:
         context_budget_chars=a.context_chars,
         preview_chars=a.preview_chars,
     )
-    rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, run_id=a.run_id, policy=policy)
+    rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
+                      run_id=a.run_id, policy=policy, prompt_sources=prompt_sources)
     # the scratch pad lives in the run directory, so it can only be rooted now
     register_scratch_tools(registry, rt.run_dir)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
@@ -124,6 +146,11 @@ def _run(a: argparse.Namespace) -> int:
 
 
 def _resume(a: argparse.Namespace) -> int:
+    given = _prompt_flags_given(a)
+    if given:
+        print(f"resume: {', '.join(given)} cannot be used on resume: the system prompt is part of "
+              "the conversation in state.json and is never re-resolved", file=sys.stderr)
+        return USAGE_ERROR
     run_dir = Path(a.runs_dir) / a.run_id
     workdir = Path(a.workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +201,23 @@ def _tools(a: argparse.Namespace) -> int:
     return 0
 
 
+def _prompt(a: argparse.Namespace) -> int:
+    """Print the system prompt a run would start with, or where it came from."""
+    try:
+        text, sources = _system_prompt(a)
+    except PromptError as e:
+        print(f"prompt: {e}", file=sys.stderr)
+        return USAGE_ERROR
+    if not a.sources:
+        print(text)
+        return 0
+    width = max(len(s["role"]) for s in sources)
+    for s in sources:
+        print(f"{s['role']:<{width}}  {s['source']}  {s['chars']} chars")
+    print(f"total: {len(text)} chars")
+    return 0
+
+
 def _replay(a: argparse.Namespace) -> int:
     source = Path(a.runs_dir) / a.run_id
     try:
@@ -218,6 +262,16 @@ def build_parser() -> argparse.ArgumentParser:
     tools_help = ("module exporting `registry` or `register(registry)`; dotted name or path "
                   "to a .py file. Repeatable.")
 
+    def prompt_args(sp) -> None:
+        """How the system prompt is assembled. Shared by run, resume and prompt."""
+        sp.add_argument("--system-prompt", metavar="FILE", default=None,
+                        help="use this file as the system prompt instead of the built-in one")
+        sp.add_argument("--append-system-prompt", action="append", metavar="FILE",
+                        help="append this file after the global prompt. Repeatable.")
+        sp.add_argument("--no-global-prompt", action="store_true",
+                        help=f"ignore the global prompt (${GLOBAL_ENV}, "
+                             "$XDG_CONFIG_HOME/harness/system.md, ~/.config/harness/system.md)")
+
     def model_args(sp, *, model_required: bool) -> None:
         """Everything needed to reach a provider. Shared by run and resume."""
         sp.add_argument("--model", required=model_required, default=None,
@@ -251,6 +305,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--result-chars", type=int, default=2000)
     r.add_argument("--context-chars", type=int, default=60000)
     r.add_argument("--preview-chars", type=int, default=400)
+    prompt_args(r)
     r.set_defaults(fn=_run)
 
     rs = sub.add_parser("resume", help="continue an interrupted run (transport_error, step_cap, stalled)")
@@ -258,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
     model_args(rs, model_required=False)
     rs.add_argument("--step-cap", type=int, default=None,
                     help="raise the cap for the rest of the run (default: the cap it ran under)")
+    prompt_args(rs)      # accepted so the refusal can explain itself, never applied
     rs.set_defaults(fn=_resume)
 
     l = sub.add_parser("tools", help="list registered tools (what the agent can discover)")
@@ -265,6 +321,12 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
     l.add_argument("--filter", default=None, help="keyword filter, like toolbelt_list")
     l.set_defaults(fn=_tools)
+
+    pr = sub.add_parser("prompt", help="print the system prompt a run would start with")
+    prompt_args(pr)
+    pr.add_argument("--sources", action="store_true",
+                    help="print where each layer of the prompt came from instead of the prompt")
+    pr.set_defaults(fn=_prompt)
 
     p_replay = sub.add_parser("replay", help="re-drive a recorded run against today's tools")
     p_replay.add_argument("run_id")

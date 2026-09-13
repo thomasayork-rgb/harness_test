@@ -2,7 +2,9 @@
 
 One JSONL file per run. Record types:
 
-  header  - run_id, model, harness_version, step_cap, task, ts
+  header  - run_id, model, harness_version, step_cap, task, ts, and
+            prompt_sources: which prompt files the system message was built
+            from (see harness.prompts)
   step    - one per tool call (discovery and todo calls included) or per
             text-only turn; carries reasoning, tool, args, result preview,
             token usage, todo snapshot, an artifact reference, and
@@ -58,7 +60,7 @@ class TrajectoryWriter:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def header(self, *, run_id: str, model: str, step_cap: int, task: str, config: dict,
-               policy: Any = None) -> None:
+               policy: Any = None, prompt_sources: list[dict] | None = None) -> None:
         self._write({
             "type": "header",
             "run_id": run_id,
@@ -69,6 +71,7 @@ class TrajectoryWriter:
             "task": task,
             "config": config,
             "policy": policy,
+            "prompt_sources": prompt_sources or [],
         })
 
     def write_artifact(self, step: int, tool: str | None, text: str) -> str:
@@ -162,6 +165,13 @@ def _epoch(ts: str | None) -> float | None:
         return None
 
 
+def format_prompt_sources(sources: list[dict] | None) -> str:
+    """One line naming every layer the system prompt was built from."""
+    if not sources:
+        return "(not recorded)"
+    return " + ".join(f"{s.get('source')} [{s.get('role')}] {s.get('chars')} chars" for s in sources)
+
+
 def last(records: list[dict], type_: str) -> dict:
     """The last record of a type, or {}. A resumed run has one footer per
     segment; the last one is the run's current answer."""
@@ -221,6 +231,7 @@ def summarize(records: list[dict]) -> dict:
         "task": header.get("task"),
         "step_cap": (resumes[-1] if resumes else header).get("step_cap"),
         "policy": (resumes[-1] if resumes else header).get("policy"),
+        "prompt_sources": header.get("prompt_sources") or [],
         "segments": 1 + len(resumes),
         "resumed_from": [r.get("from_status") for r in resumes],
         "status": footer.get("status", "incomplete"),
@@ -256,6 +267,7 @@ def format_summary(records: list[dict]) -> str:
                  f"text-only turns: {s['text_only']}  denied: {s['denied']}")
     if s["policy"]:
         lines.append(f"policy: {json.dumps(s['policy'], sort_keys=True)}")
+    lines.append("prompt: " + format_prompt_sources(s["prompt_sources"]))
     lines.append("kinds: " + (", ".join(f"{k} {n}" for k, n in s["kinds"].items()) or "(none)"))
     lines.append("tools:")
     width = max((len(t) for t in s["tools"]), default=0)
@@ -304,6 +316,7 @@ def format_trace(records: list[dict], run_dir: Path, step: int | None = None) ->
         if kind == "header":
             lines.append(f"run {rec['run_id']}  model={rec['model']}  cap={rec['step_cap']}  {rec['ts']}")
             lines.append(f"task: {rec['task'][:200]}")
+            lines.append("prompt: " + format_prompt_sources(rec.get("prompt_sources")))
             lines.append("")
         elif kind == "step":
             tool = rec["tool"] or "(text only)"

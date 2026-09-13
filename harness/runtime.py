@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .context import ContextBudget
-from .prompts import SYSTEM_PROMPT, TEXT_ONLY_NUDGE
+from .prompts import BUILTIN, PROVIDED, SYSTEM_PROMPT, TEXT_ONLY_NUDGE
 from .registry import ToolRegistry, validate_args
 from .todo import apply_update, open_ids, validate_todos
 from .trajectory import TrajectoryWriter
@@ -190,12 +190,17 @@ class AgentRuntime:
         run_id: str | None = None,
         state: RunState | None = None,
         policy: Any = None,
+        prompt_sources: list[dict] | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
         self.model = model
         self.config = config or RuntimeConfig()
         self.system_prompt = system_prompt or SYSTEM_PROMPT
+        # where that prompt came from, for the header (see harness.prompts)
+        self.prompt_sources = prompt_sources or [
+            {"source": BUILTIN if system_prompt is None else PROVIDED,
+             "role": "base", "chars": len(self.system_prompt)}]
         # policy(name, args) -> denial message or None; see harness.policy
         self.policy = policy or None
         self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -333,7 +338,8 @@ class AgentRuntime:
             {"role": "user", "content": task},
         ]
         self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task,
-                           config=asdict(cfg), policy=self._policy_description())
+                           config=asdict(cfg), policy=self._policy_description(),
+                           prompt_sources=list(self.prompt_sources))
         st.save(self.state_path)
         return self._loop()
 
