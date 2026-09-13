@@ -3,9 +3,12 @@
   harness run   --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
   harness tools [--tools mod] [--filter kw]
   harness trace <run_id> [--step N | --summary]
+  harness replay <run_id> [--workdir d] [--tools mod]
 
 Exit codes for run: 0 completed, 1 blocked/failed, 2 transport_error,
-3 step_cap, 4 stalled. A bad command line (no task, unloadable --tools) is 64.
+3 step_cap, 4 stalled. For replay: 0 identical to the recording, 1 drifted.
+A bad command line (no task, unloadable --tools) is 64; an unreadable run
+directory is 66.
 """
 from __future__ import annotations
 
@@ -16,9 +19,11 @@ from pathlib import Path
 
 from .plugins import PluginError, load_all
 from .registry import ToolRegistry
+from .replay import compare
 from .runtime import AgentRuntime, RuntimeConfig
 from .tools import register_default_tools
 from .trajectory import format_summary, format_trace, read_trajectory
+from .replay import replay as replay_run
 from .transport import ChatCompletionsTransport
 
 EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3, "stalled": 4}
@@ -87,6 +92,31 @@ def _tools(a: argparse.Namespace) -> int:
     return 0
 
 
+def _replay(a: argparse.Namespace) -> int:
+    source = Path(a.runs_dir) / a.run_id
+    try:
+        registry = _registry(a, Path(a.workdir).resolve())
+    except PluginError as e:
+        print(f"replay: --tools {e}", file=sys.stderr)
+        return USAGE_ERROR
+    try:
+        res = replay_run(source, registry, runs_dir=Path(a.runs_dir), run_id=a.new_run_id)
+    except FileNotFoundError as e:
+        print(str(e), file=sys.stderr)
+        return 66
+    print(f"replayed {a.run_id} -> {res.run_id}  status: {res.status}  steps: {res.steps}", file=sys.stderr)
+    diffs = compare(source, res.run_dir)
+    if not diffs:
+        print("identical to the recording, step for step")
+        return 0
+    print(f"{len(diffs)} difference(s) from the recording:")
+    for line in diffs[:a.max_diffs]:
+        print(f"  {line}")
+    if len(diffs) > a.max_diffs:
+        print(f"  ... {len(diffs) - a.max_diffs} more")
+    return 1
+
+
 def _trace(a: argparse.Namespace) -> int:
     run_dir = Path(a.runs_dir) / a.run_id
     try:
@@ -128,6 +158,15 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
     l.add_argument("--filter", default=None, help="keyword filter, like toolbelt_list")
     l.set_defaults(fn=_tools)
+
+    p_replay = sub.add_parser("replay", help="re-drive a recorded run against today's tools")
+    p_replay.add_argument("run_id")
+    p_replay.add_argument("--workdir", default=".", help="root for fs_* and run_shell tools")
+    p_replay.add_argument("--tools", action="append", metavar="MODULE|PATH", help=tools_help)
+    p_replay.add_argument("--new-run-id", dest="new_run_id", default=None,
+                          help="run id for the replay (default: <run_id>-replay)")
+    p_replay.add_argument("--max-diffs", type=int, default=20)
+    p_replay.set_defaults(fn=_replay)
 
     t = sub.add_parser("trace", help="print a readable trace of a run")
     t.add_argument("run_id")

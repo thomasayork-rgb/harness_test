@@ -275,7 +275,7 @@ class AgentRuntime:
                 art = self.writer.write_artifact(st.step, None, reasoning)
                 self.writer.step(run_id=self.run_id, step=st.step, elapsed_ms=elapsed, reasoning=reasoning,
                                  tool=None, args=None, result="", artifact=art, tokens_in=tok_in, tokens_out=tok_out,
-                                 todo_snapshot=list(st.todos), kind="text_only")
+                                 todo_snapshot=list(st.todos), kind="text_only", call_index=0)
                 st.messages.append({"role": "assistant", "content": reasoning})
                 if text_only >= cfg.text_only_limit:
                     status, detail = "stalled", f"{text_only} consecutive turns without a tool call"
@@ -294,8 +294,8 @@ class AgentRuntime:
                 } for c in calls],
             })
 
-            first = True
-            for c in calls:
+            for index, c in enumerate(calls):
+                first = index == 0
                 if st.step >= cfg.step_cap:
                     status, detail = "step_cap", f"step cap {cfg.step_cap} reached"
                     break
@@ -307,8 +307,7 @@ class AgentRuntime:
                 self.writer.step(run_id=self.run_id, step=st.step, elapsed_ms=(elapsed if first else 0) + dispatch_ms,
                                  reasoning=reasoning if first else "", tool=c["name"], args=c["arguments"], result=result,
                                  artifact=art, tokens_in=tok_in if first else None, tokens_out=tok_out if first else None,
-                                 todo_snapshot=list(st.todos), kind=kind)
-                first = False
+                                 todo_snapshot=list(st.todos), kind=kind, call_index=index)
                 st.messages.append({
                     "role": "tool", "tool_call_id": c["id"],
                     "content": self.budget.truncate_result(result, art),

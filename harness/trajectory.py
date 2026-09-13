@@ -5,7 +5,9 @@ One JSONL file per run. Record types:
   header  - run_id, model, harness_version, step_cap, task, ts
   step    - one per tool call (discovery and todo calls included) or per
             text-only turn; carries reasoning, tool, args, result preview,
-            token usage, todo snapshot and an artifact reference
+            token usage, todo snapshot, an artifact reference, and
+            call_index: the position of this call in its model turn, so turn
+            boundaries survive the round trip (see harness.replay)
   footer  - terminal status, step count, final answer
 
 Full tool results are written to ``artifacts/`` beside the JSONL so
@@ -74,6 +76,7 @@ class TrajectoryWriter:
         tokens_out: int | None,
         todo_snapshot: list[dict],
         kind: str,
+        call_index: int = 0,
     ) -> None:
         self._write({
             "type": "step",
@@ -85,6 +88,7 @@ class TrajectoryWriter:
             "tool": tool,
             "args": args,
             "kind": kind,
+            "call_index": call_index,
             "result_preview": result[: self.preview_chars],
             "result_bytes": len(result.encode("utf-8")),
             "artifact": artifact,
