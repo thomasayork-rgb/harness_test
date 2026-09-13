@@ -51,6 +51,28 @@ def test_budget_enforced_inside_runtime(tmp_path):
     assert sum(len(m["content"]) for m in last_msgs) <= 3500 + 1000  # bounded
 
 
+def test_the_current_turns_results_are_never_evicted(tmp_path):
+    """A budget too small to meet - a long system prompt, a tight --context-chars -
+    must not leave the model staring at a placeholder where the result it just
+    asked for should be. Its only move then is to make the same call again."""
+    r = ToolRegistry()
+    r.register(ToolSpec("big", "big", {"type": "object", "properties": {}, "required": []}, lambda: "B" * 500))
+    fake = FakeTransport([
+        {"content": "add", "tool_calls": [call("toolbelt_add", {"names": ["big"]})]},
+        {"content": "one", "tool_calls": [call("big", {})]},
+        {"content": "two at once", "tool_calls": [call("big", {}), call("big", {})]},
+        {"content": "done", "tool_calls": [call("todo_write", {"todos": [{"id": "1", "content": "x", "status": "completed"}]}),
+                                           call("final_answer", {"status": "completed", "content": "ok"})]},
+    ])
+    cfg = RuntimeConfig(result_context_chars=1000, context_budget_chars=10)   # unmeetable
+    res = AgentRuntime(r, fake, tmp_path, "fake", cfg).run("t")
+    assert res.status == "completed"
+
+    tool_msgs = [m for m in fake.requests[-1]["messages"] if m["role"] == "tool"]
+    assert [m["content"] for m in tool_msgs[-2:]] == ["B" * 500, "B" * 500]   # both calls of the turn
+    assert all(m["content"].startswith("[result evicted") for m in tool_msgs[:-2])
+
+
 def test_normalize_openai_parses_and_keeps_bad_json_raw():
     payload = {"choices": [{"message": {"content": "hi", "tool_calls": [
         {"id": "c1", "function": {"name": "f", "arguments": '{"a": 1}'}},
