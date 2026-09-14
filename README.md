@@ -7,7 +7,7 @@ A minimal ReAct agent runtime with four guarantees the loop enforces, not the pr
 3. **Think-before-act.** The assistant's text on each tool-calling turn is captured as that step's `reasoning`. No retry if it's empty. Private reasoning channels are never read.
 4. **Trajectory export.** One JSONL per run: header, one record per tool call (discovery, skill and todo calls included), a `note` record wherever the loop spoke up on its own, footer. Full tool results go to `artifacts/`; the JSONL carries a preview. `harness trace` reads it back.
 
-Plus a context budget so a local model survives a 60-step run: per-result truncation in context, oldest-result eviction past a total budget; reasoning, todo state and the results of the turn in flight are never evicted.
+Plus a context budget so a local model survives a 60-step run: per-result truncation in context, oldest-result eviction past a total budget; reasoning, todo state and the results of the turn in flight are never evicted. Protection covers the current state, not every version of it: a new `todo_write` result supersedes the earlier ones, and so does a second `skill_load` of the same skill — each older copy becomes a one-line pointer to its artifact, since a protected copy of a list that has moved on is context nothing can reclaim.
 
 Zero dependencies. Python 3.10+. Talks to any OpenAI-compatible `/v1/chat/completions` endpoint (llama.cpp server, vLLM, LM Studio, Ollama, or the real thing), or to the Anthropic Messages API with `--provider anthropic`.
 
@@ -47,7 +47,7 @@ runs/<run_id>/
 
 Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step, notes included. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, `skills` (the directories searched and the names found), and `invocation`: the endpoint, provider, workdir, `--tools` modules, skill directories and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
 
-Two other record types sit in the same file. A `note` record — `{"type": "note", "step", "kind", "text"}` — is something the loop said to the model that is not a step: so far only the progress nudge. It does not count toward the step cap; `format_trace` prints it at the seam and `trace --summary` counts it. The footer carries `todos`: the todo list as it stood when the run ended, with its notes, whether or not there was a final answer.
+Two other record types sit in the same file. A `note` record — `{"type": "note", "step", "kind", "text"}` — is something the loop said to the model that is not a step: the progress nudge (`kind: "progress_nudge"`) and the budget warning (`kind: "budget"`, once per crossing, when protected results alone exceed `--context-chars`). It does not count toward the step cap; `format_trace` prints it at the seam and `trace --summary` counts it. The footer carries `todos`: the todo list as it stood when the run ended, with its notes, whether or not there was a final answer.
 
 ## Failure semantics
 
@@ -60,6 +60,7 @@ Two other record types sit in the same file. A `note` record — `{"type": "note
 | step cap | `step_cap`, `final` is `null` |
 | tool call denied by policy | denial string as the tool result, `kind: denied`; loop continues |
 | plan unchanged for `--progress-nudge` steps | one user message asking for the plan; a `note` record, not a step |
+| protected results alone over `--context-chars` | one user message saying eviction cannot help; a `budget` note, once per crossing |
 
 All of it is visible in the trajectory. When a turn is cut short — the cap trips between two calls of it, or `final_answer` is accepted with calls queued behind it — the calls that never ran are answered in the persisted transcript with a "not executed" result, so every `tool_call` has a matching tool message and the conversation can be handed back to a provider.
 

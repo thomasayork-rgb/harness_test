@@ -10,10 +10,11 @@ One JSONL file per run. Record types:
             token usage, todo snapshot, an artifact reference, and
             call_index: the position of this call in its model turn, so turn
             boundaries survive the round trip (see harness.replay)
-  note    - something the loop said to the model that is not a step: so far
-            only the progress nudge (see RuntimeConfig.progress_nudge_steps).
-            It carries the step it followed, so a reader sees where in the run
-            it landed, and it does not count toward the step cap
+  note    - something the loop said to the model that is not a step: the
+            progress nudge (see RuntimeConfig.progress_nudge_steps) and the
+            budget warning (see ContextBudget.protected_size). It carries the
+            step it followed, so a reader sees where in the run it landed, and
+            it does not count toward the step cap
   footer  - terminal status, step count, final answer, and the todo list as it
             stood - with its notes - so a finished run is auditable per todo
             and not only per step
@@ -285,6 +286,8 @@ def summarize(records: list[dict]) -> dict:
         "skills_loaded": skills_loaded(records),
         "progress_nudges": sum(1 for r in records
                                if r.get("type") == "note" and r.get("kind") == "progress_nudge"),
+        "budget_warnings": sum(1 for r in records
+                               if r.get("type") == "note" and r.get("kind") == "budget"),
         "todos": footer.get("todos") or [],
         "segments": 1 + len(resumes),
         "resumed_from": [r.get("from_status") for r in resumes],
@@ -319,7 +322,8 @@ def format_summary(records: list[dict]) -> str:
     lines.append(f"tokens: {s['tokens_in']} in / {s['tokens_out']} out")
     lines.append(f"errors: {s['errors']}  rejected finals: {s['rejected_finals']}  "
                  f"text-only turns: {s['text_only']}  denied: {s['denied']}  "
-                 f"progress nudges: {s['progress_nudges']}")
+                 f"progress nudges: {s['progress_nudges']}  "
+                 f"budget warnings: {s['budget_warnings']}")
     if s["policy"]:
         lines.append(f"policy: {json.dumps(s['policy'], sort_keys=True)}")
     if s["skills_available"] or s["skills_loaded"]:

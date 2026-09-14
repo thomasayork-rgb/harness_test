@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from harness.cli import main
-from harness.context import EVICTED
+from harness.context import EVICTED, SUPERSEDED
 from harness.mockserver import MockOpenAIServer
 from harness.registry import ToolRegistry, ToolSpec
 from harness.runtime import META_NAMES, SKILL_META_NAMES, AgentRuntime, RuntimeConfig
@@ -321,6 +321,35 @@ def test_a_loaded_skill_is_neither_truncated_nor_evicted(tmp_path):
     skill_msg = tool_msgs[0]
     assert body in skill_msg["content"]                                    # whole, untruncated
     assert "truncated at 200" not in skill_msg["content"]
+
+
+def test_loading_a_skill_again_supersedes_the_copy_before_it(tmp_path):
+    """A skill's text is protected from eviction, so a second copy of it would
+    sit in context for the rest of the run with nothing able to remove it."""
+    root = skills_dir(tmp_path, "skills", investigate=INVESTIGATE)
+    script = [
+        {"content": "Loading.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Done with it for now.", "tool_calls": [call("skill_unload", {"name": "investigate"})]},
+        {"content": "I need it after all.", "tool_calls": [call("skill_load", {"name": "investigate"})]},
+        {"content": "Done.", "tool_calls": [todo(), FINISH]},
+    ]
+    res, fake, found = run_with_skills(tmp_path, script, [root], run_id="reload")
+    steps = steps_of(res)
+    assert [s["kind"] for s in steps[:3]] == ["ok", "ok", "ok"]
+
+    last = fake.requests[-1]["messages"]
+    tool_msgs = [m for m in last if m["role"] == "tool"]
+    body = found.get("investigate").body
+    assert sum(body in m["content"] for m in tool_msgs) == 1          # one copy, the new one
+    assert tool_msgs[0]["content"] == SUPERSEDED.format(
+        label="load of skill 'investigate'", artifact=steps[0]["artifact"])
+    # the superseded one still reads in full from the artifact it names
+    assert body in (res.run_dir / steps[0]["artifact"]).read_text(encoding="utf-8")
+
+    state = json.loads((res.run_dir / "state.json").read_text())
+    assert state["loaded_skills"] == ["investigate"]
+    protected = [m for m in state["messages"] if m["role"] == "tool" and m.get("_protected")]
+    assert len(protected) == 2 and body in protected[0]["content"]    # the skill and the todo list
 
 
 def test_a_skill_can_bring_its_own_tools_through_a_plugin(tmp_path):

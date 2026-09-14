@@ -1,10 +1,10 @@
 import json
 
 from harness.cli import main
-from harness.context import EVICTED, ContextBudget
+from harness.context import EVICTED, SUPERSEDED, ContextBudget
 from harness.registry import ToolRegistry, ToolSpec
 from harness.runtime import AgentRuntime, RuntimeConfig
-from harness.trajectory import format_trace, read_trajectory
+from harness.trajectory import format_summary, format_trace, read_trajectory, summarize
 from harness.transport import FakeTransport, call, normalize_openai
 
 
@@ -71,6 +71,115 @@ def test_the_current_turns_results_are_never_evicted(tmp_path):
     tool_msgs = [m for m in fake.requests[-1]["messages"] if m["role"] == "tool"]
     assert [m["content"] for m in tool_msgs[-2:]] == ["B" * 500, "B" * 500]   # both calls of the turn
     assert all(m["content"].startswith("[result evicted") for m in tool_msgs[:-2])
+
+
+PLAN = [{"id": f"t{i:02d}", "content": f"step {i}: check the thing and record what it said",
+         "status": "pending"} for i in range(12)]
+
+
+def keep_the_plan_moving(updates: int) -> list[dict]:
+    """One todo_write per update, each answering with the whole 12-item list."""
+    script = [{"content": "Planning.", "tool_calls": [call("todo_write", {"todos": PLAN})]}]
+    for n in range(updates):
+        i = n % len(PLAN)
+        script.append({"content": f"Update {n}.", "tool_calls": [call("todo_write", {"todos": [
+            {"id": PLAN[i]["id"], "content": PLAN[i]["content"], "status": "in_progress",
+             "notes": f"round {n}: " + "y" * 60}]}, id=f"t{n}")]})
+    script.append({"content": "Closing everything.", "tool_calls": [
+        call("todo_write", {"todos": [dict(t, status="completed") for t in PLAN]}, id="close"),
+        call("final_answer", {"status": "completed", "content": "ok"}, id="fin")]})
+    return script
+
+
+def test_only_the_newest_todo_list_holds_its_place_in_context(tmp_path):
+    """Every todo_write result is protected and carries the whole list, so 40
+    updates to a 12-item plan used to leave 80k+ chars of unevictable copies
+    against a 60k budget. Only the newest one is the plan."""
+    fake = FakeTransport(keep_the_plan_moving(40))
+    rt = AgentRuntime(ToolRegistry(), fake, tmp_path / "runs", "fake", run_id="plan")
+    res = rt.run("keep the plan moving")
+    assert res.status == "completed" and res.steps == 43
+
+    budget = rt.config.context_budget_chars
+    assert rt.budget.size(rt.state.messages) <= budget          # under budget at the end
+    protected = [m for m in rt.state.messages if m.get("_protected") and m["role"] == "tool"]
+    assert len(protected) == 1                                  # the list it just wrote
+    assert rt.budget.protected_size(rt.state.messages) == len(protected[0]["content"])
+    assert protected[0]["content"].startswith('{\n  "todos"')     # the list it just wrote
+    assert protected[0]["_artifact"].endswith("_todo_write.txt")
+
+    # what the model was actually sent on its last turn: one list, 40 pointers
+    tool_msgs = [m for m in fake.requests[-1]["messages"] if m["role"] == "tool"]
+    lists = [m for m in tool_msgs if m["content"].startswith("{")]
+    markers = [m for m in tool_msgs if m["content"].startswith("[superseded")]
+    assert len(lists) == 1 and len(markers) == 40
+    assert sum(len(m.get("content") or "") for m in fake.requests[-1]["messages"]) <= budget
+    assert not any(k.startswith("_") for m in tool_msgs for k in m)
+
+    # each pointer names the artifact that still holds that version in full
+    steps = [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
+    assert markers[0]["content"] == SUPERSEDED.format(label="todo list", artifact=steps[0]["artifact"])
+    superseded = json.loads((res.run_dir / steps[0]["artifact"]).read_text(encoding="utf-8"))
+    assert len(superseded["todos"]) == 12 and len(superseded["open"]) == 12
+    # and the trajectory still records every version, whatever context kept
+    assert sum(1 for s in steps if s["tool"] == "todo_write") == 42
+
+
+def test_a_rejected_todo_write_does_not_supersede_the_plan(tmp_path):
+    """A todo_write that never produced a list must not push the real one out
+    of context: the model would be left planning against a pointer."""
+    fake = FakeTransport([
+        {"content": "Planning.", "tool_calls": [call("todo_write", {"todos": [
+            {"id": "a", "content": "do it", "status": "in_progress"}]}, id="good")]},
+        {"content": "A malformed update.", "tool_calls": [
+            call("todo_write", {"todos": [{"id": "a", "status": "completed"}]}, id="bad")]},
+        {"content": "Properly, then.", "tool_calls": [
+            call("todo_write", {"todos": [{"id": "a", "content": "do it", "status": "completed"}]}, id="ok"),
+            call("final_answer", {"status": "completed", "content": "done"}, id="fin")]},
+    ])
+    res = AgentRuntime(ToolRegistry(), fake, tmp_path / "runs", "fake", run_id="reject").run("plan")
+    assert res.status == "completed"
+
+    steps = [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
+    assert [s["kind"] for s in steps] == ["ok", "error", "ok", "final_accepted"]
+    # on the turn after the bad call the good list was still there in full
+    tool_msgs = [m for m in fake.requests[2]["messages"] if m["role"] == "tool"]
+    assert json.loads(tool_msgs[0]["content"])["open"] == ["a"]
+    assert "must be a non-empty string" in tool_msgs[1]["content"]
+
+
+def test_protected_content_over_the_budget_is_said_once(tmp_path):
+    """Eviction cannot touch protected results, so a budget they alone exceed
+    is a fact the model has to act on - said once, not every step."""
+    r = ToolRegistry()
+    r.register(ToolSpec("echo", "echo", {"type": "object", "properties": {}, "required": []},
+                        lambda: "done"))
+    script = [{"content": "Planning.", "tool_calls": [call("todo_write", {"todos": PLAN})]},
+              {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["echo"]})]}]
+    script += [{"content": f"Working {i}.", "tool_calls": [call("echo", {})]} for i in range(3)]
+    script.append({"content": "Closing.", "tool_calls": [
+        call("todo_write", {"todos": [dict(t, status="completed") for t in PLAN]}),
+        call("final_answer", {"status": "completed", "content": "ok"})]})
+    cfg = RuntimeConfig(context_budget_chars=500, progress_nudge_steps=0)
+    fake = FakeTransport(script)
+    res = AgentRuntime(r, fake, tmp_path / "runs", "fake", cfg, run_id="over").run("plan big")
+    assert res.status == "completed"
+
+    records = read_trajectory(res.run_dir)
+    notes = [r for r in records if r["type"] == "note"]
+    assert [(n["kind"], n["step"]) for n in notes] == [("budget", 1)]      # once, after the plan
+    assert sorted(notes[0]) == ["kind", "run_id", "step", "text", "ts", "type"]  # the nudge's shape
+    assert "chars of protected results" in notes[0]["text"] and "skill_unload" in notes[0]["text"]
+    assert "over the 500 char context budget" in notes[0]["text"]
+
+    # the model was told, on the very next request, and only then
+    after = [m for m in fake.requests[1]["messages"] if m["role"] == "user"]
+    assert after[-1]["content"] == notes[0]["text"]
+    assert sum(m["content"] == notes[0]["text"]
+               for m in fake.requests[-1]["messages"] if m["role"] == "user") == 1
+    assert summarize(records)["budget_warnings"] == 1
+    assert "budget warnings: 1" in format_summary(records)
+    assert "-- budget after step 1:" in format_trace(records, res.run_dir)
 
 
 def test_normalize_openai_parses_and_keeps_bad_json_raw():

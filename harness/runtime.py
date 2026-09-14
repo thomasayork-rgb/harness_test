@@ -22,6 +22,9 @@ Failure semantics (all deliberate, all visible in the trajectory):
                                 asking for the plan to be updated, recorded as a
                                 "note" record. Not a step: it does not count
                                 toward the step cap
+  protection over the budget  → when protected results alone exceed
+                                context_budget_chars, one user message saying so
+                                and a "budget" note record, once per crossing
 
 A run that ended in one of RESUMABLE can be picked up again: rebuild the
 runtime from the persisted state and call ``resume()`` instead of ``run()``.
@@ -137,6 +140,23 @@ _META_PARAMS = {t["function"]["name"]: t["function"]["parameters"]
 # evicted: the model was told to follow it, so it has to still be there.
 SKILL_LOADED = "skill '{name}' loaded ({chars} chars). {tools}"
 SKILL_UNLOADED = "[skill '{name}' unloaded; its text is out of context. skill_load reads it again.]"
+
+# Protected results that say the same thing about a state that has moved on:
+# each new one demotes the last (see ContextBudget.supersede). The slot is what
+# they compete for; the label is what the marker left behind calls it.
+TODO_SLOT = "todos"
+TODO_LABEL = "todo list"
+SKILL_SLOT = "skill:{name}"
+SKILL_LABEL = "load of skill '{name}'"
+
+# What the loop says when protection alone is over the budget. Eviction cannot
+# help - every char of it is a char the model asked to keep - so the only way
+# back under is the model letting something go.
+BUDGET_WARNING = (
+    "Context: {protected} chars of protected results - your todo list and any loaded skills - "
+    "are already over the {budget} char context budget, so evicting old results cannot bring it "
+    "down. skill_unload anything you are done with, and keep the todo list to short items with "
+    "short notes.")
 
 
 class ResumeError(Exception):
@@ -407,7 +427,9 @@ class AgentRuntime:
         tools_note = ("tools: " + "; ".join(parts) + ".") if parts else "No tools declared."
 
         self.state.loaded_skills.append(name)
-        self._annotate = {"_protected": True, "_skill": name, "_full": True}
+        self._annotate = {"_protected": True, "_skill": name, "_full": True,
+                          "_supersedes": SKILL_SLOT.format(name=name),
+                          "_label": SKILL_LABEL.format(name=name)}
         header = SKILL_LOADED.format(name=name, chars=skill.chars, tools=plugin_note + tools_note)
         return f"{header}\n\n{skill.body}", "ok"
 
@@ -468,6 +490,22 @@ class AgentRuntime:
         st.messages.append({"role": "user", "content": text})
         self.writer.note(run_id=self.run_id, step=st.step, kind="progress_nudge", text=text)
         return 0
+
+    def _warn_protected(self, warned: bool) -> bool:
+        """One message when protected results alone are over the budget.
+
+        Said once per crossing, not once per step: a run that stays over would
+        otherwise spend the rest of its context complaining about its context.
+        """
+        protected = self.budget.protected_size(self.state.messages)
+        if protected <= self.config.context_budget_chars:
+            return False
+        if warned:
+            return True
+        text = BUDGET_WARNING.format(protected=protected, budget=self.config.context_budget_chars)
+        self.state.messages.append({"role": "user", "content": text})
+        self.writer.note(run_id=self.run_id, step=self.state.step, kind="budget", text=text)
+        return True
 
     def _close_unexecuted(self, calls: list[dict], status: str) -> None:
         """Answer the calls of a turn that was cut short, so the transcript stays well formed."""
@@ -539,6 +577,7 @@ class AgentRuntime:
         text_only = 0
         plan = signature(st.todos)      # what the plan looked like when it last moved
         idle = 0                        # steps since then
+        over_budget = False             # whether the model has been told protection is over budget
         status = "running"
         detail: str | None = None
 
@@ -611,6 +650,10 @@ class AgentRuntime:
                     "_artifact": art,
                     "_protected": c["name"] == "todo_write" or bool(extra.get("_protected")),
                 }
+                if c["name"] == "todo_write" and kind == "ok":
+                    # this result is the plan now; the ones before it are not.
+                    # A rejected todo_write carries no list, so it claims nothing.
+                    message["_supersedes"], message["_label"] = TODO_SLOT, TODO_LABEL
                 message.update(extra)
                 st.messages.append(message)
                 executed += 1
@@ -621,8 +664,10 @@ class AgentRuntime:
                     break
 
             self._close_unexecuted(calls[executed:], status)
+            self.budget.supersede(st.messages)
             self.budget.enforce(st.messages)
             if status == "running":
+                over_budget = self._warn_protected(over_budget)
                 idle = self._nudge_progress(idle)
             st.save(self.state_path)
 

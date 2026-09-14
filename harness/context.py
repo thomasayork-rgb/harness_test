@@ -9,11 +9,21 @@ Two knobs:
                   conversation fits.
 
 Never evicted: system prompt, the task, assistant turns (reasoning lives
-there), tool results flagged ``_protected`` (todo_write results, so the model
-always sees its current list), and the results of the most recent turn - the
-model has to be able to read what it just asked for, or its only move is to
-ask again. That means the budget is a target, not a ceiling: with a large
-system prompt and a small budget there may be nothing left to evict.
+there), tool results flagged ``_protected`` (the current todo list, the text of
+a loaded skill), and the results of the most recent turn - the model has to be
+able to read what it just asked for, or its only move is to ask again. That
+means the budget is a target, not a ceiling: with a large system prompt and a
+small budget there may be nothing left to evict.
+
+Protection is for the *current* state, not for every version of it. A result
+that carries ``_supersedes`` claims a slot - "the todo list", "the text of
+skill X" - and only the newest occupant of a slot keeps its text: ``supersede``
+demotes the older ones to a line naming their artifact. Without that, forty
+todo_write calls leave forty copies of the list in context, every one of them
+protected, and the budget cannot be met however much else is evicted.
+
+``protected_size`` counts what protection holds, separately from what eviction
+can still reach, so the loop can say so when the two no longer add up.
 
 Messages carry internal keys prefixed with ``_``; the transport strips them.
 """
@@ -21,6 +31,7 @@ from __future__ import annotations
 
 EVICTED = "[result evicted from context to stay within budget; full result at {artifact}]"
 TRUNCATED = "\n... [truncated at {n} chars; full result at {artifact}]"
+SUPERSEDED = "[superseded by a later {label}; this one is at {artifact}]"
 
 
 def _size(messages: list[dict]) -> int:
@@ -50,6 +61,43 @@ class ContextBudget:
         if len(text) <= self.result_chars:
             return text
         return text[: self.result_chars] + TRUNCATED.format(n=self.result_chars, artifact=artifact or "artifacts/")
+
+    def supersede(self, messages: list[dict]) -> int:
+        """Demote every result a newer one has replaced. Returns the count.
+
+        A result carrying ``_supersedes`` occupies a slot: the todo list, the
+        text of one skill. The newest occupant is the state; the earlier ones
+        describe a state that has moved on, so they lose their protection and
+        become a line pointing at the artifact that still holds them in full.
+        Already evicted or already superseded results are left alone.
+        """
+        demoted = 0
+        seen: set[str] = set()
+        for m in reversed(messages):
+            slot = m.get("_supersedes")
+            if not slot or m.get("role") != "tool":
+                continue
+            if slot not in seen:
+                seen.add(slot)          # the newest occupant keeps its text
+                continue
+            if m.get("_superseded") or m.get("_evicted"):
+                continue
+            m["content"] = SUPERSEDED.format(label=m.get("_label") or slot,
+                                             artifact=m.get("_artifact") or "artifacts/")
+            m["_protected"] = False
+            m["_superseded"] = True
+            demoted += 1
+        return demoted
+
+    def protected_size(self, messages: list[dict]) -> int:
+        """Chars in tool results eviction may not touch.
+
+        Counted apart from the rest because nothing the budget does can reduce
+        it: when this alone is over ``total_chars``, only the model can free
+        context (unload a skill, keep the plan short).
+        """
+        return sum(len(m.get("content") or "") for m in messages
+                   if m.get("role") == "tool" and m.get("_protected"))
 
     def enforce(self, messages: list[dict]) -> int:
         """Evict oldest unprotected tool results in place. Returns count evicted.
