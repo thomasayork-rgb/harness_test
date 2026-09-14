@@ -70,7 +70,8 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
 
     @registry.tool(
         "fs_read",
-        "Read a text file relative to the workdir. Optional offset/limit in characters.",
+        "Read a text file relative to the workdir. Optional offset/limit in characters.\n"
+        "A file with NUL bytes in it is refused as binary rather than decoded into noise.",
         {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"},
                                           "limit": {"type": "integer"}},
          "required": ["path"]},
@@ -83,7 +84,14 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
             raise FileNotFoundError(f"no such file: {path}")
         if not p.is_file():
             raise IsADirectoryError(f"not a file: {path}")
-        text = p.read_text(encoding="utf-8", errors="replace")
+        raw = p.read_bytes()
+        # The same guard fs_edit has: decoding a binary with errors="replace"
+        # produces thousands of characters of noise that cost context, say
+        # nothing, and read as if the file were text.
+        if b"\x00" in raw:
+            raise ValueError(f"{path} looks binary (contains NUL bytes); refusing to read. "
+                             "Use run_shell if you need to inspect it.")
+        text = raw.decode("utf-8", errors="replace")
         return {"path": path, "total_chars": len(text), "offset": offset, "content": text[offset: offset + limit]}
 
     @registry.tool(

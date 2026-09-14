@@ -189,6 +189,34 @@ def test_fs_read_errors_name_the_relative_path_only(tmp_path):
     assert str(work) not in (res.run_dir / "trajectory.jsonl").read_text(encoding="utf-8")
 
 
+def test_fs_read_refuses_a_binary_file_like_fs_edit_does(tmp_path):
+    """A binary decoded with errors="replace" is thousands of characters of
+    noise that read as if the file were text - and it all goes into context."""
+    work = project(tmp_path / "work")
+    (work / "big.bin").write_bytes(bytes(range(256)) * 200)
+    script = [
+        {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["fs_read"]})]},
+        {"content": "Reading a blob.", "tool_calls": [call("fs_read", {"path": "blob.bin"})]},
+        {"content": "And a bigger one.", "tool_calls": [call("fs_read", {"path": "big.bin"})]},
+        {"content": "Text that merely is not UTF-8 is still text.",
+         "tool_calls": [call("fs_read", {"path": "latin.txt"})]},
+        {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
+    ]
+    res, steps = drive(tmp_path, work, script)
+    assert res.status == "completed"
+    assert [s["kind"] for s in steps[1:4]] == ["error", "error", "ok"]
+    assert steps[1]["result_preview"] == (
+        "error: ValueError: blob.bin looks binary (contains NUL bytes); refusing to read. "
+        "Use run_shell if you need to inspect it.")
+    assert steps[2]["result_preview"].startswith("error: ValueError: big.bin looks binary")
+    assert steps[2]["result_bytes"] < 200          # the refusal, not 51200 chars of noise
+    assert "�" not in artifact(res, steps[2])
+
+    # a latin-1 file has no NUL bytes: it reads, with the undecodable bytes marked
+    latin = json.loads(artifact(res, steps[3]))
+    assert latin["content"] == "caf� au lait\n"
+
+
 def test_write_and_list_through_the_runtime(tmp_path):
     work = project(tmp_path / "work")
     script = [

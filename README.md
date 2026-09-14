@@ -264,7 +264,7 @@ todos:
 | tool | what it does |
 |---|---|
 | `fs_list` | list a directory |
-| `fs_read` | read a text file, optional offset/limit |
+| `fs_read` | read a text file, optional offset/limit; a file with NUL bytes is refused as binary |
 | `fs_write` | write a text file, creating parents |
 | `fs_search` | regex over file contents; name or path glob filter, result cap, line numbers |
 | `fs_glob` | find files by glob pattern |
