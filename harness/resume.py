@@ -110,6 +110,7 @@ def prepare(
     skills: Any = None,
     progress_nudge_steps: int | None = None,
     trust_project_plugins: bool | None = None,
+    hooks: Any = None,
     force: bool = False,
 ) -> tuple[AgentRuntime, str | None]:
     """Rebuild the runtime for a resumable run. Returns it with the detail of
@@ -118,8 +119,10 @@ def prepare(
     ``invocation`` is what the new segment runs under, recorded at the seam for
     the next resume; it defaults to what the recording already says. ``skills``
     is the skill set the next segment can load from - a run that could load
-    skills before must still be able to after. ``force`` takes over a run whose
-    lock is still held (see ``claim``)."""
+    skills before must still be able to after. ``hooks`` is what happens when
+    this segment ends: a project run verifies and commits however many segments
+    it takes. ``force`` takes over a run whose lock is still held (see
+    ``claim``)."""
     path = Path(run_dir)
     state, records = load(path)
     detail = claim(path, state, force)
@@ -137,7 +140,7 @@ def prepare(
     runtime = AgentRuntime(registry, transport, path.parent, model or state.model, config,
                            run_id=path.name, state=state, policy=policy,
                            invocation=invocation or recorded_invocation(records),
-                           skills=skills)
+                           skills=skills, hooks=hooks)
     # a run that was never closed has no footer of its own; any footer in the
     # file belongs to an earlier segment and would misname what stopped this one
     return runtime, detail if detail is not None else last(records, "footer").get("detail")
@@ -155,11 +158,13 @@ def resume(
     skills: Any = None,
     progress_nudge_steps: int | None = None,
     trust_project_plugins: bool | None = None,
+    hooks: Any = None,
     force: bool = False,
 ) -> RunResult:
     """Continue a run in place. The trajectory grows; it is not replaced."""
     runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap,
                               policy=policy, invocation=invocation, skills=skills,
                               progress_nudge_steps=progress_nudge_steps,
-                              trust_project_plugins=trust_project_plugins, force=force)
+                              trust_project_plugins=trust_project_plugins, hooks=hooks,
+                              force=force)
     return runtime.resume(detail)

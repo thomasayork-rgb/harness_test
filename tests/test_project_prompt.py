@@ -16,8 +16,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-
 from harness.cli import main
 from harness.codemap import INDEX_FILE, MAP_RELATIVE, scaffold
 from harness.mockserver import MockOpenAIServer

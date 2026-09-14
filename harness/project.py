@@ -142,7 +142,7 @@ def identity_args(repo: Any) -> list[str]:
     return ["-c", f"user.name={FALLBACK_NAME}", "-c", f"user.email={FALLBACK_EMAIL}"]
 
 
-def _entry_paths(line: str) -> list[str]:
+def entry_paths(line: str) -> list[str]:
     """The path(s) one ``git status --porcelain`` line is about."""
     body = line[3:] if len(line) > 3 else ""
     parts = [p.strip() for p in body.split(" -> ")] if " -> " in body else [body]
@@ -164,7 +164,7 @@ def dirty_entries(path: Any) -> list[str]:
     """The status lines that stop a project run: everything but ``tasks/``."""
     out = []
     for line in status_entries(path):
-        paths = _entry_paths(line)
+        paths = entry_paths(line)
         if paths and all(any(p.startswith(prefix) for prefix in IGNORED_DIRTY) for p in paths):
             continue
         out.append(line)
@@ -181,7 +181,7 @@ def dirty_message(repo: Any, entries: list[str]) -> str:
     """Why a dirty project refuses to start, in the terms of what is dirty."""
     shown = "\n".join(f"  {line}" for line in entries[:10])
     more = f"\n  ... {len(entries) - 10} more" if len(entries) > 10 else ""
-    mapped = any(p.startswith(MAP_DIR) for line in entries for p in _entry_paths(line))
+    mapped = any(p.startswith(MAP_DIR) for line in entries for p in entry_paths(line))
     why = (f"\nuncommitted {MAP_DIR} changes matter most: the worktree is cut from HEAD, so the "
            "agent would run without the map you are looking at." if mapped else "")
     return (f"--project {repo} has uncommitted changes:\n{shown}{more}{why}\n"
@@ -287,6 +287,21 @@ class ProjectRun:
         """The ``project`` block of the trajectory header."""
         return {"path": str(self.repo), "base_sha": self.base_sha, "branch": self.branch,
                 "worktree": str(self.worktree), "task_id": self.task_id}
+
+    @classmethod
+    def from_header(cls, block: Any, run_id: str, worktree: Any = None) -> "ProjectRun":
+        """The run a recorded ``project`` block describes, so a resumed segment
+        finishes the same way the first one would have.
+
+        ``worktree`` overrides what the block says, for a tree that had to be
+        cut again (see ``reattach``).
+        """
+        if not isinstance(block, dict) or not block.get("path"):
+            raise ProjectError("this run's trajectory has no project block")
+        return cls(repo=Path(block["path"]), run_id=run_id, branch=block.get("branch") or "",
+                   base_sha=block.get("base_sha") or "",
+                   worktree=Path(worktree if worktree is not None else (block.get("worktree") or "")),
+                   task_id=block.get("task_id"))
 
     def abandon(self) -> None:
         """Best-effort cleanup for a run that never started: drop the worktree,

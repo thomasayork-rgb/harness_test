@@ -17,7 +17,8 @@ One JSONL file per run. Record types:
             it does not count toward the step cap
   footer  - terminal status, step count, final answer, and the todo list as it
             stood - with its notes - so a finished run is auditable per todo
-            and not only per step
+            and not only per step; plus ``verify`` and ``commit``, what the
+            finish hooks made of the run (see harness.finish), or null
 
 The header (and each resume record) also carries ``policy`` - what the
 tool-call policy in force denied, or null - and ``invocation``: how the segment
@@ -95,6 +96,14 @@ class TrajectoryWriter:
         (self.artifacts / name).write_text(text, encoding="utf-8")
         return f"artifacts/{name}"
 
+    def write_named_artifact(self, name: str, text: str) -> str:
+        """An artifact that belongs to the run rather than to one step - the
+        output of the verify command, which the footer points at and never
+        carries."""
+        safe = _SAFE.sub("_", name)
+        (self.artifacts / safe).write_text(text, encoding="utf-8")
+        return f"artifacts/{safe}"
+
     def step(
         self,
         *,
@@ -162,7 +171,8 @@ class TrajectoryWriter:
         })
 
     def footer(self, *, run_id: str, status: str, steps: int, final: dict | None,
-               detail: str | None = None, todos: list[dict] | None = None) -> None:
+               detail: str | None = None, todos: list[dict] | None = None,
+               verify: dict | None = None, commit: dict | None = None) -> None:
         self._write({
             "type": "footer",
             "run_id": run_id,
@@ -172,6 +182,10 @@ class TrajectoryWriter:
             "final": final,
             "detail": detail,
             "todos": todos or [],
+            # what the finish hooks made of it: the checks run against the
+            # answer, and the commit the work was saved as (see harness.finish)
+            "verify": verify,
+            "commit": commit,
         })
 
 
@@ -203,6 +217,39 @@ def format_project(block: dict | None) -> str:
     return (f"project: {block.get('path')}  branch {block.get('branch')}  from "
             f"{str(block.get('base_sha') or '')[:12]}{task}\n         worktree "
             f"{block.get('worktree')}")
+
+
+def format_verify(block: dict | None) -> str:
+    """One line for what the finish hooks checked (see harness.finish)."""
+    if not block:
+        return ""
+    if block.get("error"):
+        return f"verify: did not run ({block['error']})"
+    test = block.get("test")
+    if not test:
+        parts = ["verify: no test command"]
+    else:
+        outcome = ("timed out" if test.get("timed_out") else
+                   "passed" if test.get("passed") else "FAILED")
+        parts = [f"verify: tests {outcome} (exit {test.get('exit')}, "
+                 f"{(test.get('elapsed_ms') or 0) / 1000:.1f} s, {test.get('artifact')})"]
+    mapped = block.get("map_stale") or {}
+    area = ", ".join(mapped.get("area") or []) or "(nothing changed)"
+    if mapped.get("clean", True):
+        parts.append(f"map clean for {area}")
+    else:
+        parts.append("map STALE: " + ", ".join(e.get("package", "?") for e in mapped.get("stale") or []))
+    return "  ".join(parts)
+
+
+def format_commit(block: dict | None) -> str:
+    """One line for the commit a finished run left on its branch."""
+    if not block:
+        return ""
+    if block.get("error"):
+        return f"commit: not made ({block['error']})"
+    return (f"commit: {str(block.get('sha') or '')[:12]}  {block.get('message')}  "
+            f"({block.get('files')} file(s))")
 
 
 def format_prompt_sources(sources: list[dict] | None) -> str:
@@ -308,6 +355,8 @@ def summarize(records: list[dict]) -> dict:
         "resumed_from": [r.get("from_status") for r in resumes],
         "status": footer.get("status", "incomplete"),
         "detail": footer.get("detail"),
+        "verify": footer.get("verify"),
+        "commit": footer.get("commit"),
         "steps": footer.get("steps", len(steps)),
         "final": footer.get("final"),
         "kinds": dict(sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))),
@@ -341,6 +390,10 @@ def format_summary(records: list[dict]) -> str:
                  f"text-only turns: {s['text_only']}  denied: {s['denied']}  "
                  f"progress nudges: {s['progress_nudges']}  "
                  f"budget warnings: {s['budget_warnings']}")
+    if s["verify"]:
+        lines.append(format_verify(s["verify"]))
+    if s["commit"]:
+        lines.append(format_commit(s["commit"]))
     if s["policy"]:
         lines.append(f"policy: {json.dumps(s['policy'], sort_keys=True)}")
     if s["skills_available"] or s["skills_loaded"]:

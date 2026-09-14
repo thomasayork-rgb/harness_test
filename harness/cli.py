@@ -39,6 +39,7 @@ from typing import Any
 
 from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
 from .codemap import format_stale, scaffold, scan, stale
+from .finish import TEST_TIMEOUT, project_hooks
 from .plugins import PluginError, load_all
 from .policy import ToolPolicy
 from .project import (ProjectError, ProjectRun, format_worktrees, prune as prune_worktrees,
@@ -130,6 +131,11 @@ def _invocation(a: argparse.Namespace, workdir: Path, extra: dict,
     if project is not None:
         out["project"] = str(project.repo)
         out["task_id"] = project.task_id
+        # what the finish hooks were told to do, so a resumed segment finishes
+        # the way this one would have (see harness.finish)
+        out["test_command"] = a.test_command
+        out["test_timeout"] = a.test_timeout
+        out["auto_commit"] = bool(a.auto_commit)
     return out
 
 
@@ -209,10 +215,13 @@ def _build(a: argparse.Namespace, workdir: Path, run_id: str | None,
         progress_nudge_steps=a.progress_nudge,
         trust_project_plugins=a.trust_project_plugins,
     )
+    hooks = project_hooks(project, test_command=a.test_command, test_timeout=a.test_timeout,
+                          trust_project=a.trust_project_plugins, auto_commit=a.auto_commit,
+                          area=task.area if task else ()) if project else None
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
                       run_id=run_id, policy=policy, prompt_sources=prompt_sources,
                       invocation=_invocation(a, workdir, extra, skills, project), skills=skills,
-                      project=project.header() if project else None)
+                      project=project.header() if project else None, hooks=hooks)
     # the scratch pad lives in the run directory, so it can only be rooted now
     register_scratch_tools(registry, rt.run_dir)
     return rt
@@ -447,6 +456,7 @@ def _resume(a: argparse.Namespace) -> int:
     # again from the branch, and the model is told what that cost (harness.project)
     project = recorded_project(records)
     recreated: str | None = None
+    hooks = None
     if project and not a.workdir:
         try:
             worktree, recreated = reattach(project)
@@ -454,6 +464,7 @@ def _resume(a: argparse.Namespace) -> int:
             print(f"resume: {e}", file=sys.stderr)
             return USAGE_ERROR
         workdir = worktree.resolve()
+        hooks = _recorded_hooks(a, project, rec, workdir)
         print(f"project {project.get('path')}  branch {project.get('branch')}"
               + ("  (worktree recreated)" if recreated else ""), file=sys.stderr)
     else:
@@ -485,7 +496,7 @@ def _resume(a: argparse.Namespace) -> int:
                                     invocation=invocation,
                                     skills=skills, progress_nudge_steps=a.progress_nudge,
                                     trust_project_plugins=a.trust_project_plugins or None,
-                                    force=a.force)
+                                    hooks=hooks, force=a.force)
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
@@ -505,6 +516,26 @@ def _resume(a: argparse.Namespace) -> int:
     if res.final:
         print(res.final.get("content", ""))
     return EXIT.get(res.status, 1)
+
+
+def _recorded_hooks(a: argparse.Namespace, block: dict, rec: dict, worktree: Path) -> Any:
+    """The finish hooks a resumed segment runs under: the ones the run was
+    started with, from what it recorded, in the worktree it is continuing in.
+
+    A segment that is resumed verifies and commits like any other, so a run
+    that took three attempts still ends with its work on the branch.
+    """
+    run = ProjectRun.from_header(block, a.run_id, worktree)
+    area: list[str] = []
+    if run.task_id:
+        try:
+            area = load_task(run.repo, run.task_id).area
+        except TaskError as e:
+            print(f"resume: {e}", file=sys.stderr)
+    return project_hooks(run, test_command=rec.get("test_command"),
+                         test_timeout=rec.get("test_timeout") or TEST_TIMEOUT,
+                         trust_project=a.trust_project_plugins,
+                         auto_commit=rec.get("auto_commit", True), area=area)
 
 
 def _tasks(a: argparse.Namespace) -> int:
@@ -772,6 +803,16 @@ def build_parser() -> argparse.ArgumentParser:
                         metavar="N",
                         help="ceiling for the project layer of the system prompt; excerpt lines "
                              f"are dropped from the bottom to fit (default: {PROJECT_PROMPT_CHARS})")
+        sp.add_argument("--test-command", metavar="CMD", default=None,
+                        help="shell command run in the worktree after an accepted final answer; "
+                             "its result goes in the footer and its output in "
+                             "artifacts/verify_test.txt. Without it, .harness/project.json's "
+                             "test command is used only with --trust-project-plugins.")
+        sp.add_argument("--test-timeout", type=float, default=TEST_TIMEOUT, metavar="S",
+                        help=f"seconds for that command (default: {TEST_TIMEOUT:g})")
+        sp.add_argument("--auto-commit", action=argparse.BooleanOptionalAction, default=True,
+                        help="commit the worktree on the task branch when the run ends, however "
+                             "it ended (default). --no-auto-commit leaves it uncommitted.")
 
     def loop_args(sp) -> None:
         """The knobs of the loop itself. Shared by run and bench."""

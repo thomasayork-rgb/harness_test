@@ -87,7 +87,9 @@ def test_a_project_run_works_in_a_worktree_cut_from_head(tmp_path, capsys):
     assert (worktree / "NOTES.md").read_text() == "worktree only\n"     # the agent wrote in the worktree
     assert not (repo / "NOTES.md").exists()                             # never in the project
     assert git(worktree, "rev-parse", "--abbrev-ref", "HEAD").strip() == "task/wt-run"
-    assert git(worktree, "rev-parse", "HEAD").strip() == base           # cut from HEAD
+    # cut from HEAD, with the run's own commit on top of it (see harness.finish)
+    assert git(worktree, "rev-parse", "HEAD~").strip() == base
+    assert git(worktree, "log", "-1", "--format=%s").strip() == "harness: wt-run — completed"
     assert "task/wt-run" in branches(repo) and head(repo) == base       # the project did not move
 
     header = read_trajectory(runs / "wt-run")[0]
@@ -252,10 +254,13 @@ def test_no_keep_worktree_removes_a_clean_tree_and_keeps_the_branch(tmp_path, ca
 
 
 def test_no_keep_worktree_leaves_a_dirty_tree_alone(tmp_path, capsys):
+    """Only --no-auto-commit can leave one: otherwise the run committed its own
+    work and there is nothing in the tree to lose (see tests/test_finish.py)."""
     repo = sample_project(tmp_path / "project")
     runs = tmp_path / "runs"
     with MockOpenAIServer(project_script(), model="mock-model", api_key=SECRET) as server:
-        assert run_project(runs, repo, server, "kept", "--no-keep-worktree") == 0
+        assert run_project(runs, repo, server, "kept", "--no-keep-worktree",
+                           "--no-auto-commit") == 0
     err = capsys.readouterr().err
     assert (runs / "kept" / "wt" / "NOTES.md").is_file()           # the agent's work is still there
     assert "has uncommitted changes; left in place" in err
@@ -265,7 +270,7 @@ def test_worktree_list_and_prune(tmp_path, capsys):
     repo = sample_project(tmp_path / "project")
     runs = tmp_path / "runs"
     with MockOpenAIServer(project_script(), model="mock-model", api_key=SECRET) as server:
-        assert run_project(runs, repo, server, "done-dirty") == 0
+        assert run_project(runs, repo, server, "done-dirty", "--no-auto-commit") == 0
     with MockOpenAIServer(paused_script(), model="mock-model", api_key=SECRET) as server:
         assert run_project(runs, repo, server, "paused", "--step-cap", "2") == 3
     # a finished run whose worktree is clean: nothing to lose by removing it
@@ -361,13 +366,13 @@ def test_resume_after_the_worktree_is_gone_cuts_a_new_one_and_says_so(tmp_path, 
         {"content": "Closing.", "tool_calls": [todo("completed")]},
         {"content": "Reporting.", "tool_calls": [FINISH]},
     ]
+    sha = git(repo, "rev-parse", "task/pruned").strip()   # what the recreated tree is cut from
     with MockOpenAIServer(rest, model="mock-model", api_key=SECRET) as server:
         rc = main(["--runs-dir", str(runs), "resume", "pruned", "--endpoint", server.base_url,
                    "--api-key", SECRET, "--step-cap", "20"])
         messages = server.requests[0]["body"]["messages"]
     assert rc == 0
 
-    sha = git(repo, "rev-parse", "task/pruned").strip()
     expected = (f"worktree was recreated from branch task/pruned at {sha}; uncommitted changes "
                 "from the pruned worktree are gone.")
     seam = next(r for r in read_trajectory(runs / "pruned") if r["type"] == "resume")

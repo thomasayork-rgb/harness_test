@@ -217,6 +217,30 @@ class ResumeError(Exception):
 
 
 @dataclass
+class RunHooks:
+    """What runs after the loop and before the footer.
+
+    ``verify(runtime) -> dict | None`` is called only when a final answer was
+    accepted: it checks the answer against something outside the conversation -
+    a test command, the code map - and there is nothing to check about a run
+    that never got there.
+
+    ``finish(runtime, status) -> dict | None`` is called whatever ended the run,
+    interrupted included, because that is exactly when the work has to be
+    saved. Both are given the runtime, so a hook can read the state, the todos
+    and the run directory; what each returns goes in the footer (``verify`` and
+    ``commit``), so a reader sees it beside the status it belongs to.
+
+    A hook that raises does not cost the run its footer: what it raised is
+    recorded where its block would have been. See harness.finish for the pair a
+    project run is given.
+    """
+
+    verify: Any = None
+    finish: Any = None
+
+
+@dataclass
 class RuntimeConfig:
     step_cap: int = 250
     require_todos: bool = True
@@ -308,6 +332,7 @@ class AgentRuntime:
         invocation: dict | None = None,
         skills: SkillSet | None = None,
         project: dict | None = None,
+        hooks: RunHooks | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
@@ -323,6 +348,9 @@ class AgentRuntime:
         # the repository, branch and worktree this run works in, or None for a
         # run pointed at a plain directory (see harness.project)
         self.project = dict(project) if project else None
+        # what happens between the last step and the footer: verify the answer,
+        # then save the work (see RunHooks and harness.finish)
+        self.hooks = hooks or RunHooks()
         # where that prompt came from, for the header (see harness.prompts)
         self.prompt_sources = prompt_sources or [
             {"source": BUILTIN if system_prompt is None else PROVIDED,
@@ -664,6 +692,24 @@ class AgentRuntime:
         finally:
             self._unlock()
 
+    def _hook(self, hook: Any, *args: Any) -> dict | None:
+        """One finish hook, contained.
+
+        A hook reaches outside the loop - a test command, git - so it is the
+        one place a run can still fail after the work is done. Whatever it
+        raises, Ctrl-C included, is recorded where its block would have been
+        and the footer is written anyway: a run without a footer is a run
+        nothing can read.
+        """
+        if hook is None:
+            return None
+        try:
+            return hook(self, *args)
+        except KeyboardInterrupt:
+            return {"error": "interrupted"}
+        except Exception as e:  # noqa: BLE001 - the footer matters more than the hook
+            return {"error": f"{type(e).__name__}: {e}"}
+
     def _loop(self) -> RunResult:
         st = self.state
         try:
@@ -677,8 +723,11 @@ class AgentRuntime:
 
         st.status = status
         st.save(self.state_path)
+        # an answer is checked; the work is saved whether or not there is one
+        verify = self._hook(self.hooks.verify) if st.final else None
+        commit = self._hook(self.hooks.finish, status)
         self.writer.footer(run_id=self.run_id, status=status, steps=st.step, final=st.final,
-                           detail=detail, todos=list(st.todos))
+                           detail=detail, todos=list(st.todos), verify=verify, commit=commit)
         return RunResult(run_id=self.run_id, status=status, steps=st.step, final=st.final, run_dir=self.run_dir)
 
     def _turns(self) -> tuple[str, str | None]:
