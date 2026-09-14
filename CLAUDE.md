@@ -78,6 +78,7 @@ python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N] [--force]  # afte
 python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
 python -m harness --runs-dir RUNS bench TASKS.jsonl ...     # a file of tasks, one table, bench.jsonl
 python -m harness map scaffold --project P [--package PKG]  # write or refresh docs/map/
+python -m harness map stale --project P [--area PKG] [--json]  # exit 1 if the map is behind
 python -m harness --runs-dir RUNS worktree list|prune --project P   # the worktrees of that project's runs
 python -m harness tools [--tools SPEC]                      # what the agent can discover
 python -m harness skills [--skills DIR] [--workdir W]      # what the agent can load
@@ -124,7 +125,7 @@ harness/
   replay.py        ReplayTransport, replay(), compare()
   plugins.py       --tools loading
   project.py       --project worktrees, dirty rules, git denials, worktree list|prune
-  codemap.py       docs/map/ scaffolding: packages, imports, public names, INDEX.md
+  codemap.py       docs/map/ scaffolding and staleness (stale against HEAD, stale_against_tree)
   frontmatter.py   the --- block: parse_frontmatter, dump, split_frontmatter
   skills.py        SKILL.md frontmatter, discovery, SkillSet (--skills)
   mockserver.py    MockOpenAIServer, MockAnthropicServer for tests

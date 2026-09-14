@@ -11,6 +11,7 @@
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
   harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
   harness map    scaffold --project PATH [--package PKG]
+  harness map    stale --project PATH [--area PKG] [--json]
   harness worktree list|prune --project PATH [--force]
   harness trace  <run_id> [--step N | --summary]
   harness replay <run_id> [--workdir d] [--tools mod] [--deny-tool NAME]
@@ -19,7 +20,8 @@ Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
 transport_error, 3 step_cap, 4 stalled, 130 interrupted. For replay: 0 identical to the
 recording, 1 drifted. For bench: 0 if every task completed, 1 otherwise. A
 bad command line (no task, unloadable --tools, an unreadable prompt file, a
-run that cannot be resumed) is 64; an unreadable run directory is 66.
+run that cannot be resumed) is 64; an unreadable run directory is 66. For map
+stale: 0 when the map describes the tree, 1 when any package is out of date.
 """
 from __future__ import annotations
 
@@ -32,7 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
-from .codemap import scaffold, scan
+from .codemap import format_stale, scaffold, scan, stale
 from .plugins import PluginError, load_all
 from .policy import ToolPolicy
 from .project import (ProjectError, ProjectRun, format_worktrees, prune as prune_worktrees,
@@ -427,15 +429,26 @@ def _map(a: argparse.Namespace) -> int:
     """Write or refresh the code map of a project (see harness.codemap)."""
     try:
         repo = repo_root(a.project)
+        project = scan(repo)
+        if a.map_cmd == "stale":
+            report = stale(repo, a.area, project=project)
+            if a.json:
+                print(json.dumps({"stale": report, "clean": not report}, indent=2))
+            else:
+                print(format_stale(report))
+            if not report:
+                print(f"{len(project.names())} package(s) in {repo}", file=sys.stderr)
+            return 1 if report else 0
+
+        if a.package and not project.select(a.package):
+            known = ", ".join(project.names()) or "(none)"
+            print(f"map: no package '{a.package}' in {repo}. Packages: {known}", file=sys.stderr)
+            return USAGE_ERROR
+        written = scaffold(repo, a.package, project=project)
     except ProjectError as e:
         print(f"map: {e}", file=sys.stderr)
         return USAGE_ERROR
-    project = scan(repo)
-    if a.package and not project.select(a.package):
-        known = ", ".join(project.names()) or "(none)"
-        print(f"map: no package '{a.package}' in {repo}. Packages: {known}", file=sys.stderr)
-        return USAGE_ERROR
-    for action, rel in scaffold(repo, a.package, project=project):
+    for action, rel in written:
         print(f"{action:<9}  {rel}")
     print("commit before running tasks.", file=sys.stderr)
     return 0
@@ -689,6 +702,13 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("--package", default=None, metavar="PKG",
                     help="refresh only this package and its subpackages (default: all of them)")
     ms.set_defaults(fn=_map)
+    mt = msub.add_parser("stale", help="which packages the map no longer describes (exit 1 if any)")
+    mt.add_argument("--project", required=True, metavar="PATH", help="the git repository")
+    mt.add_argument("--area", action="append", metavar="PKG",
+                    help="only this package and its subpackages. Repeatable.")
+    mt.add_argument("--json", action="store_true",
+                    help='print {"stale": [{"package", "reasons"}], "clean": bool}')
+    mt.set_defaults(fn=_map)
 
     w = sub.add_parser("worktree", help="list or prune the worktrees of a project's runs")
     wsub = w.add_subparsers(dest="worktree_cmd", required=True)

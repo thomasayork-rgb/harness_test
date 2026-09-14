@@ -26,6 +26,13 @@ file as it was when the frontmatter was written, computed in Python
 ls-tree``. Nothing here records a timestamp, so the same tree always produces
 the same bytes, and a scaffold that changed nothing rewrites nothing.
 
+Staleness is that sha, answered twice. ``stale()`` asks git what HEAD holds, so
+``harness map stale`` answers for the repository. ``stale_against_tree()``
+hashes the files of a worktree in Python with no git call at all, so a run can
+be told at the end whether the map still describes what it just changed. Either
+way the reasons are the same three: no map file, no Purpose, or files that have
+moved on from what the frontmatter was generated from.
+
 Nothing here imports or executes the project: every file is read as text and
 parsed with ``ast``. A file that does not parse is listed under ``errors`` and
 otherwise counted like any other.
@@ -37,9 +44,10 @@ import hashlib
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .frontmatter import FrontmatterError, NoFrontmatter, dump, parse_frontmatter, split_frontmatter
+from .project import git
 from .tools.paths import SKIP_DIRS
 
 MAP_RELATIVE = Path("docs") / "map"
@@ -221,7 +229,9 @@ def scan(root: Any) -> Project:
     """Read the project: packages, modules, imports, inbound references."""
     root = Path(root).resolve()
     dirs = walk_dirs(root)
-    package_dirs = {d: dotted(root, d) for d in dirs if (d / INIT).is_file()}
+    # the root is never a package of itself: its dotted name would be empty, and
+    # what it would be called depends on a directory above the project
+    package_dirs = {d: dotted(root, d) for d in dirs if d != root and (d / INIT).is_file()}
 
     modules: list[Module] = []
     by_package: dict[str, list[Module]] = {name: [] for name in package_dirs.values()}
@@ -235,7 +245,10 @@ def scan(root: Any) -> Project:
             rel = directory.relative_to(root).as_posix()
             unpackaged.append(f"{rel}/" if rel != "." else "./")
         for path in files:
-            module = read_module(root, path, package)
+            try:
+                module = read_module(root, path, package)
+            except OSError:
+                continue          # a file we cannot read is a file we cannot map
             modules.append(module)
             if package is not None:
                 by_package[package].append(module)
@@ -390,3 +403,120 @@ def scaffold(root: Any, package: str | None = None,
     index = root / MAP_RELATIVE / INDEX_FILE
     out.append((_write(index, index_text(project)), index.relative_to(root).as_posix()))
     return out
+
+
+# ---- staleness -------------------------------------------------------------
+
+NO_MAP = "no map file"
+NO_PURPOSE = "no Purpose"
+NOT_A_PACKAGE = "not a package in this project"
+UNCOMMITTED = "no files for this package in HEAD; nothing is committed yet"
+
+
+def head_blobs(root: Any, rev: str = "HEAD") -> dict[str, str]:
+    """``path -> blob sha`` for every file the repository holds at ``rev``."""
+    out = git("ls-tree", "-r", "-z", rev, cwd=root)
+    blobs: dict[str, str] = {}
+    for entry in out.split("\0"):
+        if not entry.strip():
+            continue
+        info, _, path = entry.partition("\t")
+        fields = info.split()
+        if len(fields) >= 3 and fields[1] == "blob":
+            blobs[path] = fields[2]
+    return blobs
+
+
+def _package_files(blobs: dict[str, str], package: Package, root: Path) -> dict[str, str]:
+    """The package's own ``.py`` files out of a path -> sha mapping: its
+    directory, not its subpackages, which are packages of their own."""
+    prefix = package.directory.relative_to(root).as_posix() + "/"
+    return {path: sha for path, sha in blobs.items()
+            if path.startswith(prefix) and path.endswith(".py")
+            and "/" not in path[len(prefix):]}
+
+
+def _reasons(map_path: Path, files: dict[str, str], uncommitted: str | None = None) -> list[str]:
+    """Why this package's map is out of date, in the order a reader wants: the
+    file that moved on first, then the prose that was never written."""
+    try:
+        text = map_path.read_text(encoding="utf-8")
+    except OSError:
+        return [NO_MAP]
+    try:
+        meta, body = parse_frontmatter(text)
+    except (NoFrontmatter, FrontmatterError) as e:
+        return [f"map file cannot be read: {e}"]
+
+    recorded = meta.get("generated_from")
+    recorded = recorded if isinstance(recorded, dict) else {}
+    out: list[str] = []
+    if not files and recorded and uncommitted:
+        out.append(uncommitted)
+    else:
+        for path, sha in sorted(files.items()):
+            if path not in recorded:
+                out.append(f"not in the map: {path}")
+            elif recorded[path] != sha:
+                out.append(f"changed since the map was written: {path}")
+        for path in sorted(recorded):
+            if path not in files:
+                out.append(f"in the map but gone: {path}")
+    if not section(body, "Purpose"):
+        out.append(NO_PURPOSE)
+    return out
+
+
+def _report(project: Project, root: Path, areas: Iterable[str] | None,
+            shas: dict[str, str], uncommitted: str | None = None) -> list[dict]:
+    """``[{"package", "reasons"}]`` for every package that is out of date."""
+    wanted = list(areas or [])
+    selected = [p for name, p in project.packages.items()
+                if not wanted or any(name == a or name.startswith(a + ".") for a in wanted)]
+    out: list[dict] = []
+    for area in wanted:
+        if not project.select(area):
+            out.append({"package": area, "reasons": [NOT_A_PACKAGE]})
+    for package in selected:
+        reasons = _reasons(package.map_file(root), _package_files(shas, package, project.root),
+                           uncommitted)
+        if reasons:
+            out.append({"package": package.dotted, "reasons": reasons})
+    return sorted(out, key=lambda r: r["package"])
+
+
+def stale(root: Any, areas: Iterable[str] | None = None,
+          project: Project | None = None) -> list[dict]:
+    """Which packages the map no longer describes, against HEAD.
+
+    HEAD, not the working tree: the map is committed beside the code it
+    describes, so "stale" is a question about what the repository holds, not
+    about what someone has open in an editor.
+    """
+    root = Path(root).resolve()
+    project = project or scan(root)
+    return _report(project, root, areas, head_blobs(root), uncommitted=UNCOMMITTED)
+
+
+def stale_against_tree(project_root: Any, packages: Iterable[str] | None = None,
+                       tree_root: Any = None) -> list[dict]:
+    """The same question asked of a worktree, with no git call at all.
+
+    ``project_root`` is where ``docs/map/`` is read from; ``tree_root`` is the
+    tree whose files are hashed (a run's worktree, with the edits that have not
+    been committed yet). Same reasons, same shape as ``stale``.
+    """
+    project_root = Path(project_root).resolve()
+    tree_root = Path(tree_root).resolve() if tree_root is not None else project_root
+    project = scan(tree_root)
+    shas = {module.rel: module.sha for module in project.modules}
+    return _report(project, project_root, packages, shas)
+
+
+def format_stale(report: list[dict]) -> str:
+    """One line per package, with the reasons behind it."""
+    if not report:
+        return "map is clean"
+    width = max(len(entry["package"]) for entry in report)
+    return "\n".join(f"{entry['package']:<{width}}  " + "; ".join(entry["reasons"])
+                      for entry in report)

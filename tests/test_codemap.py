@@ -7,14 +7,16 @@ that the frontmatter says what is true about the tree, that the prose under it
 survives a refresh byte for byte, and that the same tree always produces the
 same bytes.
 """
+import json
+import shutil
 from pathlib import Path
 
 from harness.cli import main
 from harness.codemap import (INDEX_FILE, MAP_RELATIVE, SECTIONS, TEMPLATE, blob_sha, scaffold,
-                             scan, section)
+                             scan, section, stale, stale_against_tree)
 from harness.frontmatter import parse_frontmatter
 
-from .gitfixture import git, sample_project, write
+from .gitfixture import commit_all, git, sample_project, write
 
 MAP = MAP_RELATIVE.as_posix()
 
@@ -243,3 +245,130 @@ def test_the_map_skips_worktrees_and_its_own_directory(tmp_path):
     assert project.names() == ["alpha", "alpha.nested", "beta"]
     assert all("wt/" not in rel for package in project.packages.values() for rel in package.files)
     assert project.unpackaged == ["scripts/"]
+
+
+# ---- staleness -------------------------------------------------------------
+
+
+def fill_purpose(repo: Path, package: str, text: str = "Does the work.") -> Path:
+    path = repo / MAP_RELATIVE / f"{package}.md"
+    return write(path, path.read_text(encoding="utf-8").replace(
+        "## Purpose", f"## Purpose\n\n{text}", 1))
+
+
+def mapped_project(tmp_path) -> Path:
+    """A project whose map is scaffolded, written and committed: clean."""
+    repo = sample_project(tmp_path / "p")
+    scaffold(repo)
+    for package in ("alpha", "alpha.nested", "beta"):
+        fill_purpose(repo, package, f"What {package} is for.")
+    commit_all(repo, "map the project")
+    return repo
+
+
+def test_a_committed_map_is_clean_and_a_committed_change_makes_it_stale(tmp_path):
+    repo = mapped_project(tmp_path)
+    assert stale(repo) == []
+
+    core = repo / "alpha" / "core.py"
+    write(core, core.read_text(encoding="utf-8") + "\n\ndef stop():\n    return None\n")
+    assert stale(repo) == []                    # HEAD is the question, not the editor
+    commit_all(repo, "add stop()")
+    assert stale(repo) == [{"package": "alpha",
+                            "reasons": ["changed since the map was written: alpha/core.py"]}]
+
+    scaffold(repo, "alpha")
+    commit_all(repo, "refresh the map")
+    assert stale(repo) == []
+
+
+def test_a_new_file_a_removed_file_a_missing_map_and_an_empty_purpose(tmp_path):
+    repo = mapped_project(tmp_path)
+    write(repo / "alpha" / "extra.py", "def extra():\n    return 1\n")
+    (repo / "alpha" / "nested" / "deep.py").unlink()
+    (repo / MAP_RELATIVE / "beta.md").unlink()
+    commit_all(repo, "move things around")
+
+    report = {entry["package"]: entry["reasons"] for entry in stale(repo)}
+    assert report["alpha"] == ["not in the map: alpha/extra.py"]
+    assert report["alpha.nested"] == ["in the map but gone: alpha/nested/deep.py"]
+    assert report["beta"] == ["no map file"]
+
+    scaffold(repo)
+    commit_all(repo, "refresh")
+    assert [e["package"] for e in stale(repo)] == ["beta"]          # the new map has no Purpose
+    assert stale(repo)[0]["reasons"] == ["no Purpose"]
+
+
+def test_area_restricts_and_an_unknown_area_says_so(tmp_path):
+    repo = mapped_project(tmp_path)
+    (repo / MAP_RELATIVE / "beta.md").unlink()
+    write(repo / "alpha" / "nested" / "extra.py", "x = 1\n")
+    commit_all(repo, "break two of them")
+
+    assert [e["package"] for e in stale(repo)] == ["alpha.nested", "beta"]
+    assert [e["package"] for e in stale(repo, ["alpha"])] == ["alpha.nested"]   # subpackages count
+    assert stale(repo, ["beta"]) == [{"package": "beta", "reasons": ["no map file"]}]
+    assert stale(repo, ["gamma"]) == [{"package": "gamma",
+                                       "reasons": ["not a package in this project"]}]
+
+
+def test_map_stale_from_the_cli_with_json_and_exit_codes(tmp_path, capsys):
+    repo = mapped_project(tmp_path)
+    assert main(["map", "stale", "--project", str(repo)]) == 0
+    out = capsys.readouterr()
+    assert out.out.strip() == "map is clean" and "3 package(s)" in out.err
+
+    core = repo / "alpha" / "core.py"
+    write(core, core.read_text(encoding="utf-8") + "\n\ndef stop():\n    return None\n")
+    commit_all(repo, "add stop()")
+
+    assert main(["map", "stale", "--project", str(repo)]) == 1
+    assert "alpha  changed since the map was written: alpha/core.py" in capsys.readouterr().out
+
+    assert main(["map", "stale", "--project", str(repo), "--json"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report == {"clean": False, "stale": [
+        {"package": "alpha", "reasons": ["changed since the map was written: alpha/core.py"]}]}
+
+    assert main(["map", "stale", "--project", str(repo), "--area", "beta", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"clean": True, "stale": []}
+
+
+def test_stale_against_tree_needs_no_git_at_all(tmp_path):
+    repo = mapped_project(tmp_path)
+    tree = tmp_path / "copy"                    # a plain directory: no repository anywhere
+    shutil.copytree(repo, tree, ignore=shutil.ignore_patterns(".git"))
+    assert not (tree / ".git").exists()
+
+    assert stale_against_tree(tree) == []
+    write(tree / "beta" / "util.py", "import json\n\n\ndef helper(sep):\n    return json.dumps(sep)\n")
+    assert stale_against_tree(tree) == [
+        {"package": "beta", "reasons": ["changed since the map was written: beta/util.py"]}]
+    assert stale_against_tree(tree, ["alpha"]) == []
+
+    # the map may live in the project while the code being judged is a worktree
+    assert stale_against_tree(repo, ["beta"], tree_root=tree) == [
+        {"package": "beta", "reasons": ["changed since the map was written: beta/util.py"]}]
+    assert stale_against_tree(repo, ["beta"], tree_root=repo) == []
+
+
+def test_a_package_that_was_never_committed_says_that(tmp_path):
+    repo = mapped_project(tmp_path)
+    write(repo / "gamma" / "__init__.py", "")
+    write(repo / "gamma" / "thing.py", "def thing():\n    return 1\n")
+    scaffold(repo)
+    fill_purpose(repo, "gamma", "Brand new.")
+    assert stale(repo, ["gamma"]) == [
+        {"package": "gamma", "reasons": ["no files for this package in HEAD; nothing is committed yet"]}]
+    commit_all(repo, "add gamma")
+    assert stale(repo, ["gamma"]) == []
+
+
+def test_map_stale_on_a_repository_with_no_commits_is_a_usage_error(tmp_path, capsys):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    git(empty, "init", "-b", "main")
+    write(empty / "pkg" / "__init__.py", "")
+    assert main(["map", "stale", "--project", str(empty)]) == 64
+    assert "map: git ls-tree" in capsys.readouterr().err
