@@ -15,10 +15,12 @@ Format - ``skills/<name>/SKILL.md`` or ``skills/<name>.md``::
     ---
     The body is the skill: whatever the model should read before doing the work.
 
-The frontmatter is parsed here, not by a YAML library: ``key: value`` scalars,
-``[a, b]`` inline lists, ``- item`` block lists, and indented continuation
-lines for a multi-line value. Anything else in the block is an error naming the
-line, because a skill the author thought they wrote is worse than none.
+The frontmatter is parsed by ``harness.frontmatter``, not by a YAML library:
+``key: value`` scalars, ``[a, b]`` inline lists, ``- item`` block lists, and
+indented continuation lines for a multi-line value. Anything else in the block
+is an error naming the line, because a skill the author thought they wrote is
+worse than none. That parser is shared with the project map and task files;
+here its errors come back as ``SkillError``, naming the skill file.
 
 Discovery merges every location that exists, lowest precedence first::
 
@@ -40,15 +42,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from . import frontmatter
+
 SKILL_FILE = "SKILL.md"
 SKILLS_ENV = "HARNESS_SKILLS"
 XDG_ENV = "XDG_CONFIG_HOME"
 CONFIG_RELATIVE = Path("harness") / "skills"
 PROJECT_RELATIVE = Path(".harness") / "skills"
-FENCE = "---"
+FENCE = frontmatter.FENCE
 
-_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s*(.*)$")
-_ITEM = re.compile(r"^-\s+(.*)$")
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -60,62 +62,19 @@ class NoFrontmatter(SkillError):
     """No ``---`` block at all: a markdown file that was never a skill."""
 
 
-def _scalar(raw: str) -> str:
-    text = raw.strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
-        return text[1:-1]
-    return text
-
-
-def _inline_list(raw: str) -> list[str] | None:
-    text = raw.strip()
-    if not (text.startswith("[") and text.endswith("]")):
-        return None
-    inner = text[1:-1].strip()
-    return [_scalar(part) for part in inner.split(",") if part.strip()] if inner else []
-
-
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     """``(metadata, body)`` for a skill file. Raises SkillError on a block this
-    parser cannot read, NoFrontmatter when there is no block at all."""
-    lines = text.lstrip("\ufeff").splitlines()
-    i = 0
-    while i < len(lines) and not lines[i].strip():
-        i += 1
-    if i >= len(lines) or lines[i].strip() != FENCE:
-        raise NoFrontmatter(f"no '{FENCE}' frontmatter block")
-    i += 1
+    parser cannot read, NoFrontmatter when there is no block at all.
 
-    meta: dict[str, Any] = {}
-    key: str | None = None
-    closed = False
-    while i < len(lines):
-        line = lines[i]
-        i += 1
-        if line.strip() == FENCE:
-            closed = True
-            break
-        if not line.strip():
-            continue
-        item = _ITEM.match(line.strip())
-        if item and key is not None and isinstance(meta.get(key), list):
-            meta[key].append(_scalar(item.group(1)))
-            continue
-        if line[:1].isspace() and key is not None and isinstance(meta.get(key), str):
-            meta[key] = (meta[key] + "\n" + line.strip()).strip()
-            continue
-        found = _KEY.match(line.strip())
-        if not found:
-            raise SkillError(f"line {i}: not a 'key: value' frontmatter line: {line.strip()[:60]!r}")
-        key, raw = found.group(1), found.group(2).strip()
-        if not raw:
-            meta[key] = []            # a '- item' block may follow
-        else:
-            inline = _inline_list(raw)
-            meta[key] = inline if inline is not None else _scalar(raw)
-    if not closed:
-        raise SkillError(f"frontmatter block is not closed with '{FENCE}'")
-    return meta, "\n".join(lines[i:]).strip()
+    The parser is ``harness.frontmatter``; this wrapper only re-labels its
+    errors, so what a skill file is allowed to say stays one definition.
+    """
+    try:
+        return frontmatter.parse_frontmatter(text)
+    except frontmatter.NoFrontmatter as e:
+        raise NoFrontmatter(str(e)) from None
+    except frontmatter.FrontmatterError as e:
+        raise SkillError(str(e)) from None
 
 
 def _string_list(value: Any, what: str) -> list[str]:

@@ -2,6 +2,7 @@
 name: final-report
 description: What a good final_answer.content contains, and what it must never contain.
 ---
+
 # Write the final answer
 
 `final_answer(status, content)` is the whole deliverable. It is read by someone

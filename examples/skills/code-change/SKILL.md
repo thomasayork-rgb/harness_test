@@ -1,8 +1,9 @@
 ---
 name: code-change
-description: Change code in a project safely: find it, read it, edit it exactly, run the tests.
+description: "Change code in a project safely: find it, read it, edit it exactly, run the tests."
 tools: [fs_search, fs_read, fs_edit, run_shell]
 ---
+
 # Make a change to a project
 
 A change nobody verified is a guess. Finish with the diff and the test output,

@@ -120,6 +120,7 @@ harness/
   resume.py        load a run directory and rebuild the runtime around it
   replay.py        ReplayTransport, replay(), compare()
   plugins.py       --tools loading
+  frontmatter.py   the --- block: parse_frontmatter, dump, split_frontmatter
   skills.py        SKILL.md frontmatter, discovery, SkillSet (--skills)
   mockserver.py    MockOpenAIServer, MockAnthropicServer for tests
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize

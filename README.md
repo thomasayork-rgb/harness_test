@@ -172,8 +172,11 @@ plugin: ./tools.py                   # optional --tools module, relative to this
 The body is the skill: what the model should read before doing this kind of work.
 ```
 
-The frontmatter is parsed with the stdlib alone — `key: value` scalars, `[a, b]` inline lists,
-`- item` block lists, indented continuation lines. `description` is required and its **first line**
+The frontmatter is parsed with the stdlib alone by `harness.frontmatter` — `key: value` scalars,
+`[a, b]` inline lists, `- item` block lists, indented continuation lines, one-level-or-deeper nested
+mappings and `"quoted keys"`. Values are strings; `harness.frontmatter.dump` writes the canonical
+form back (keys in order, lists inline, quotes only where a value needs them), which is what the
+shipped skills are written in. `description` is required and its **first line**
 is all `skill_list` shows, so make it count; put the detail in the body. A `.md` file with no
 frontmatter is not a skill and is skipped; a `<name>/SKILL.md` that cannot be parsed is reported on
 stderr, once, and left out.
@@ -397,6 +400,7 @@ harness/
   replay.py        ReplayTransport, replay, compare
   mockserver.py    MockOpenAIServer, MockAnthropicServer (scripted, stdlib http.server)
   plugins.py       --tools module loading
+  frontmatter.py   the --- block: parse, dump, split (shared by skills and the project files)
   skills.py        SKILL.md frontmatter, discovery, SkillSet
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
   prompts.py       the prompt layers: built-in, global file, appends
