@@ -11,7 +11,8 @@ from harness.anthropic import (DEFAULT_MAX_TOKENS, AnthropicMessagesTransport, n
                                to_messages_request)
 from harness.cli import main
 from harness.mockserver import HttpError, MockAnthropicServer
-from harness.runtime import META_NAMES
+from harness.registry import ToolRegistry
+from harness.runtime import META_NAMES, AgentRuntime, RuntimeConfig
 from harness.trajectory import read_trajectory
 from harness.transport import TransportError, call
 
@@ -209,6 +210,27 @@ def test_anthropic_http_error_and_bad_key_are_transport_errors(tmp_path, capsys)
                "--provider", "anthropic", "--endpoint", "http://127.0.0.1:1/v1",
                "--workdir", str(tmp_path), "--extra-body", '{"thinking": {"type": "adaptive"}}'])
     assert rc == 64 and "extended thinking" in capsys.readouterr().err
+
+
+def test_an_overloaded_messages_api_is_waited_out_as_it_asked(tmp_path):
+    """529 is the API saying it is overloaded; Retry-After says for how long."""
+    waited: list[float] = []
+    done = [{"content": "Back. Closing.", "tool_calls": [call("todo_write", {"todos": [
+                {"id": "1", "content": "ask", "status": "completed"}]})]},
+            {"content": "Finishing.", "tool_calls": [call("final_answer", {
+                "status": "completed", "content": "ok"})]}]
+    script = [HttpError(529, "overloaded", retry_after=3),
+              HttpError(429, "slow down", retry_after="in a bit"),   # not seconds: unusable
+              *done]
+    with MockAnthropicServer(script, model="a-model", api_key=SECRET) as server:
+        transport = AnthropicMessagesTransport(server.base_url, api_key=SECRET, sleep=waited.append)
+        res = AgentRuntime(ToolRegistry(), transport, tmp_path / "runs", "a-model",
+                           RuntimeConfig(transport_retries=2), run_id="busy").run("ask the busy API")
+        served = server.served
+
+    assert res.status == "completed" and served == 4
+    assert waited == [3.0, 4.0]          # the header, then the schedule it fell back to
+    assert read_trajectory(res.run_dir)[-1]["status"] == "completed"
 
 
 def test_resume_over_the_anthropic_provider(tmp_path):

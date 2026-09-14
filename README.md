@@ -57,7 +57,7 @@ Two other record types sit in the same file. A `note` record — `{"type": "note
 | bad tool args, unknown/inactive tool, tool raises | error string returned as the tool result; loop continues |
 | `final_answer` with open todos | rejection naming the open ids; loop continues |
 | turn with no tool call | recorded as `text_only`; nudge appended; 3 in a row → `stalled` |
-| transport error | one retry, then `transport_error` |
+| transport error | retried (default: once), waiting 1 s before the first retry and 4 s before any later one — or what a `Retry-After` on a 429/529 asked for, capped at 60 s — then `transport_error` |
 | step cap | `step_cap`, `final` is `null` |
 | Ctrl-C (`KeyboardInterrupt`) | `interrupted`, footer written, the calls of the turn in flight answered "not executed"; exit `130` |
 | tool call denied by policy | denial string as the tool result, `kind: denied`; loop continues |
@@ -263,7 +263,7 @@ todos:
 
 | tool | what it does |
 |---|---|
-| `fs_list` | list a directory |
+| `fs_list` | list a directory, skipping `.git`/cache/vendor directories |
 | `fs_read` | read a text file, optional offset/limit; a file with NUL bytes is refused as binary |
 | `fs_write` | write a text file, creating parents |
 | `fs_search` | regex over file contents; name or path glob filter, result cap, line numbers |
@@ -272,7 +272,7 @@ todos:
 | `run_shell` | run a command in the workdir; a non-zero exit is a result, a timeout is an error |
 | `scratch_write` / `scratch_read` / `scratch_list` | notes under the run directory that survive context eviction |
 
-The `fs_*` tools are rooted to `--workdir`: a path that resolves outside it is refused, never clamped. `run_shell` starts there but is not a sandbox — a shell command can still walk out, which is what `--deny-shell-pattern` is for. What it does not get is the harness's own configuration: the child environment is this process's minus every `HARNESS_*` variable, so `env` in a command cannot write `HARNESS_API_KEY` into a result, an artifact or the trajectory. Each command runs in its own session, and a timeout kills that whole process group — what the command backgrounded dies with it instead of outliving the run. `fs_search` and `fs_glob` skip binary files, files over 2 MB, and `.git`/cache/vendor directories. `harness tools [--filter kw]` prints the list the agent would see.
+The `fs_*` tools are rooted to `--workdir`: a path that resolves outside it is refused, never clamped. `run_shell` starts there but is not a sandbox — a shell command can still walk out, which is what `--deny-shell-pattern` is for. What it does not get is the harness's own configuration: the child environment is this process's minus every `HARNESS_*` variable, so `env` in a command cannot write `HARNESS_API_KEY` into a result, an artifact or the trajectory. Each command runs in its own session, and a timeout kills that whole process group — what the command backgrounded dies with it instead of outliving the run. `fs_search` and `fs_glob` skip binary files, files over 2 MB, and `.git`/cache/vendor directories, and `fs_list` skips those same directories. `harness tools [--filter kw]` prints the list the agent would see.
 
 The scratch pad is per run, not per workdir: `scratch_write` saves a short note under `runs/<run_id>/scratch/`, and `scratch_read` gets it back whatever the context budget did in between. The *result* of a scratch call is an ordinary tool result — truncated and evictable like any other — but the note on disk is not, so an agent that writes down what it found can still answer for it forty steps later. Notes the user should keep belong in the workdir, via `fs_write`. Because they are rooted in the run directory, the CLI registers them once the run exists, and `harness replay` registers a pad in the replay's own run directory, so a recording that took notes replays as a run that takes notes.
 
@@ -321,7 +321,7 @@ python -m harness run --provider anthropic --endpoint https://api.anthropic.com/
   --model <model-id> --api-key "$KEY" --task "..." --workdir ./project
 ```
 
-The runtime speaks one message shape; the transport translates. Out: system messages become the top-level `system` parameter, tool schemas become `{name, description, input_schema}`, assistant tool calls become `tool_use` blocks, and all the tool results of one turn go back as `tool_result` blocks in a single user message, so parallel calls stay parallel. In: `text` blocks become the step's reasoning, `tool_use` blocks become tool calls, and `usage` becomes `{prompt_tokens, completion_tokens}` with cached input counted as input. HTTP failures map to `transport_error` with the same one retry. `--extra-body` works for both providers.
+The runtime speaks one message shape; the transport translates. Out: system messages become the top-level `system` parameter, tool schemas become `{name, description, input_schema}`, assistant tool calls become `tool_use` blocks, and all the tool results of one turn go back as `tool_result` blocks in a single user message, so parallel calls stay parallel. In: `text` blocks become the step's reasoning, `tool_use` blocks become tool calls, and `usage` becomes `{prompt_tokens, completion_tokens}` with cached input counted as input. HTTP failures map to `transport_error` with the same retries and the same backoff, `Retry-After` included. `--extra-body` works for both providers.
 
 Extended thinking is **not supported**. `thinking` and `redacted_thinking` blocks are private reasoning, and guarantee 3 says the harness never reads them — they are dropped, never turned into reasoning and never written to the trajectory. Since the API wants those blocks echoed back on later turns of a tool-use conversation, asking for thinking through `--extra-body` is refused up front rather than producing a conversation the API will later reject.
 
@@ -367,7 +367,7 @@ with MockOpenAIServer([{"content": "Listing.", "tool_calls": [call("toolbelt_lis
 server.requests      # every request body and header it received
 ```
 
-Script entries are response dicts (`content`, `tool_calls`, `usage`), raw wire payloads, callables, or `HttpError(status)`; an exhausted script answers 503 rather than hanging. A `reasoning_content` (OpenAI) or `thinking` (Anthropic) key puts a private reasoning channel in the response, which the tests use to prove the harness never reads one.
+Script entries are response dicts (`content`, `tool_calls`, `usage`), raw wire payloads, callables, or `HttpError(status, message, retry_after=...)` — which sends `Retry-After`, so the backoff can be tested; an exhausted script answers 503 rather than hanging. A `reasoning_content` (OpenAI) or `thinking` (Anthropic) key puts a private reasoning channel in the response, which the tests use to prove the harness never reads one.
 
 ## Tests
 

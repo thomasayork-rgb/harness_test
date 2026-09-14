@@ -7,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 from ..registry import ToolRegistry
-from .paths import make_resolver
+from .paths import SKIP_DIRS, make_resolver
 
 # Everything the harness configures itself with lives under this prefix, and
 # HARNESS_API_KEY is one of them. A shell command inherits the environment, so
@@ -47,7 +47,8 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
 
     @registry.tool(
         "fs_list",
-        "List files and directories under a path relative to the workdir.",
+        "List files and directories under a path relative to the workdir.\n"
+        "Skips the directories the search tools skip: .git, caches, vendored trees.",
         {"type": "object", "properties": {"path": {"type": "string"}, "max_entries": {"type": "integer"}},
          "required": []},
     )
@@ -59,7 +60,8 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
             return {"path": path, "type": "file", "bytes": p.stat().st_size}
         entries = []
         for child in sorted(p.iterdir()):
-            if child.name.startswith(".git"):
+            # the same noise the walking tools skip: .git, caches, vendored trees
+            if child.name in SKIP_DIRS:
                 continue
             entries.append({"name": child.name, "type": "dir" if child.is_dir() else "file",
                             "bytes": child.stat().st_size if child.is_file() else None})

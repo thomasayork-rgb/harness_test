@@ -20,13 +20,46 @@ from __future__ import annotations
 
 import itertools
 import json
+import time
 import urllib.error
 import urllib.request
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+# A transport error is retried by the loop (RuntimeConfig.transport_retries),
+# which waits between attempts: 1s before the first retry, 4s before any later
+# one. The waiting is done through the transport's ``sleep``, so a test can
+# hand in one that records the schedule instead of living through it.
+RETRY_STATUSES = (429, 529)     # rate limited and overloaded: the two worth waiting on
+RETRY_AFTER_MAX = 60.0          # a provider that asks for longer gets this instead
+
+
+def retry_after_seconds(headers: Any, status: int) -> float | None:
+    """The wait a 429 or 529 asked for, in seconds and capped, or None.
+
+    Only the seconds form of ``Retry-After`` is read; the HTTP-date form, and
+    anything that is not a number, fall back to the schedule.
+    """
+    if status not in RETRY_STATUSES or headers is None:
+        return None
+    try:
+        value = float(str(headers.get("Retry-After")).strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if value != value or value < 0:      # NaN, or a wait that is not one
+        return None
+    return min(value, RETRY_AFTER_MAX)
 
 
 class TransportError(Exception):
-    pass
+    """A request that produced no usable response.
+
+    ``retry_after`` is what the provider asked to be waited, in seconds, when
+    it said so in a header; the loop waits that instead of its own schedule.
+    """
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class Transport(Protocol):
@@ -70,6 +103,7 @@ class ChatCompletionsTransport:
         api_key: str | None = None,
         timeout: float = 120.0,
         extra: dict | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         if not self.endpoint.endswith("/chat/completions"):
@@ -77,6 +111,7 @@ class ChatCompletionsTransport:
         self.api_key = api_key
         self.timeout = timeout
         self.extra = extra or {}
+        self.sleep = sleep or time.sleep     # how the loop waits between retries
 
     def complete(self, messages: list[dict], tools: list[dict], model: str) -> dict:
         body: dict = {"model": model, "messages": public_messages(messages), **self.extra}
@@ -93,7 +128,8 @@ class ChatCompletionsTransport:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:500]
-            raise TransportError(f"HTTP {e.code}: {detail}") from e
+            raise TransportError(f"HTTP {e.code}: {detail}",
+                                 retry_after=retry_after_seconds(e.headers, e.code)) from e
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
             raise TransportError(str(e)) from e
         return normalize_openai(payload)
@@ -110,6 +146,11 @@ class FakeTransport:
     def __init__(self, script: list[Any]) -> None:
         self.script = list(script)
         self.requests: list[dict] = []
+        self.delays: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        """A scripted transport waits for nobody: the retry delay is recorded."""
+        self.delays.append(seconds)
 
     def complete(self, messages: list[dict], tools: list[dict], model: str) -> dict:
         self.requests.append({"messages": public_messages(messages), "tools": tools, "model": model})

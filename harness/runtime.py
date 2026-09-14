@@ -13,7 +13,9 @@ Failure semantics (all deliberate, all visible in the trajectory):
   final_answer with open todo → rejection naming the ids; loop continues
   text-only turn              → recorded as a step; nudge appended;
                                 N consecutive → status "stalled"
-  transport error             → retry once, then status "transport_error"
+  transport error             → retried transport_retries times, waiting
+                                RETRY_DELAYS between attempts (or the provider's
+                                Retry-After), then status "transport_error"
   step cap                    → status "step_cap", final null
   KeyboardInterrupt           → status "interrupted", footer written, the calls
                                 of the turn in flight answered "not executed";
@@ -119,6 +121,11 @@ SKILL_META_TOOLS: list[dict] = [
     }},
 ]
 SKILL_META_NAMES = {t["function"]["name"] for t in SKILL_META_TOOLS}
+
+# What the loop waits before a retry: the first one, then every later one. A
+# provider that asked for a particular wait (Retry-After on a 429 or 529) gets
+# that instead. transport_retries decides how many of these there are at all.
+RETRY_DELAYS = (1.0, 4.0)
 
 # Statuses a run can be picked up from. completed/blocked/failed are answers,
 # not interruptions. "running" is not here because it means a process may still
@@ -341,12 +348,24 @@ class AgentRuntime:
         return meta + active
 
     def _complete(self, messages: list[dict]) -> dict:
+        """One request, retried on transport errors with a wait between attempts.
+
+        The wait is RETRY_DELAYS, unless the provider said how long it wants
+        (a Retry-After on a 429 or 529), and it is taken through the
+        transport's own ``sleep`` so a test can hand in one that only records.
+        """
+        sleep = getattr(self.transport, "sleep", time.sleep)
+        attempts = self.config.transport_retries + 1
         last: Exception | None = None
-        for _ in range(self.config.transport_retries + 1):
+        for attempt in range(attempts):
             try:
                 return self.transport.complete(messages, self._tools_payload(), self.model)
             except TransportError as e:
                 last = e
+                if attempt + 1 >= attempts:
+                    break
+                asked = getattr(e, "retry_after", None)
+                sleep(asked if asked is not None else RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
         raise last  # type: ignore[misc]
 
     # ---- dispatch ---------------------------------------------------------

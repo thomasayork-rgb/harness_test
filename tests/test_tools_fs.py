@@ -26,6 +26,9 @@ def project(tmp_path):
     (tmp_path / "latin.txt").write_bytes(b"caf\xe9 au lait\n")   # no NUL, still not UTF-8
     (tmp_path / "__pycache__").mkdir()
     (tmp_path / "__pycache__" / "cached.py").write_text("hello cache\n", encoding="utf-8")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("*.pyc\n", encoding="utf-8")   # a file, not a skipped dir
     return tmp_path
 
 
@@ -245,15 +248,17 @@ def test_write_and_list_through_the_runtime(tmp_path):
         "ok", "ok", "ok", "error", "error", "ok", "ok", "ok", "error", "error", "error",
         "ok", "ok", "final_accepted"]
 
+    # the noise the search tools skip is not listed either: no .git, no
+    # __pycache__ - but .gitignore is a file the agent may well want to read
     root = json.loads(artifact(res, steps[1]))
     assert [e["name"] for e in root["entries"]] == [
-        "__pycache__", "blob.bin", "latin.txt", "notes.md", "src"]
-    assert [e["type"] for e in root["entries"]][0] == "dir"
+        ".gitignore", "blob.bin", "latin.txt", "notes.md", "src"]
+    assert [e["type"] for e in root["entries"]][-1] == "dir"
     assert json.loads(artifact(res, steps[2])) == {"path": "notes.md", "type": "file", "bytes": 33}
     assert "FileNotFoundError: nope" in steps[3]["result_preview"]
     assert "escapes workdir: ../" in steps[4]["result_preview"]
     capped = json.loads(artifact(res, steps[5]))
-    assert [e["name"] for e in capped["entries"]] == ["__pycache__", "blob.bin", "..."]
+    assert [e["name"] for e in capped["entries"]] == [".gitignore", "blob.bin", "..."]
 
     assert json.loads(steps[6]["result_preview"]) == {"path": "out/deep/report.txt", "bytes": 6}
     assert (work / "out" / "deep" / "report.txt").read_text() == "second\n"

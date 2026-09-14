@@ -12,9 +12,10 @@ from pathlib import Path
 
 from harness.cli import main
 from harness.mockserver import HttpError, MockOpenAIServer
-from harness.runtime import META_NAMES
+from harness.registry import ToolRegistry
+from harness.runtime import META_NAMES, AgentRuntime, RuntimeConfig
 from harness.trajectory import read_trajectory
-from harness.transport import call
+from harness.transport import ChatCompletionsTransport, call
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TASK = "Find the port in the config and report it"
@@ -137,6 +138,40 @@ def test_http_error_becomes_transport_error_exit_2(tmp_path, capsys):
     footer = read_trajectory(runs / "boom")[-1]
     assert footer["status"] == "transport_error" and "HTTP 500" in footer["detail"]
     assert "upstream exploded" in footer["detail"]
+
+
+DONE = [{"content": "Back. Closing.", "tool_calls": [call("todo_write", {"todos": [
+            {"id": "1", "content": "ask", "status": "completed"}]})]},
+        {"content": "Finishing.", "tool_calls": [call("final_answer", {
+            "status": "completed", "content": "ok"})]}]
+
+
+def test_a_rate_limited_request_waits_as_long_as_the_provider_asked(tmp_path):
+    """429 and 529 carry a Retry-After; retrying straight away is how a rate
+    limit turns into a dead run."""
+    waited: list[float] = []
+    script = [HttpError(429, "slow down", retry_after=2),
+              HttpError(429, "still busy", retry_after=999),      # more than the cap
+              *DONE]
+    with MockOpenAIServer(script, model="mock-model") as server:
+        transport = ChatCompletionsTransport(server.base_url, sleep=waited.append)
+        rt = AgentRuntime(ToolRegistry(), transport, tmp_path / "runs", "mock-model",
+                          RuntimeConfig(transport_retries=2), run_id="limited")
+        res = rt.run("ask the busy endpoint")
+        served = server.served
+
+    assert res.status == "completed" and served == 4     # two refusals, then the two turns
+    assert waited == [2.0, 60.0]                         # what it asked for, capped
+    assert read_trajectory(res.run_dir)[-1]["status"] == "completed"
+
+
+def test_an_ordinary_http_error_waits_on_the_schedule(tmp_path):
+    waited: list[float] = []
+    with MockOpenAIServer([HttpError(500, "upstream exploded"), *DONE], model="mock-model") as server:
+        transport = ChatCompletionsTransport(server.base_url, sleep=waited.append)
+        res = AgentRuntime(ToolRegistry(), transport, tmp_path / "runs", "mock-model",
+                           run_id="sched").run("ask the broken endpoint")
+    assert res.status == "completed" and waited == [1.0]  # no header to honour
 
 
 def test_bad_api_key_is_a_transport_error(tmp_path):

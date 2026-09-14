@@ -31,11 +31,12 @@ refused outright rather than half-honoured.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable
 
-from .transport import TransportError, public_messages
+from .transport import TransportError, public_messages, retry_after_seconds
 
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
@@ -153,6 +154,7 @@ class AnthropicMessagesTransport:
         extra: dict | None = None,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         version: str = ANTHROPIC_VERSION,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         if not self.endpoint.endswith("/messages"):
@@ -162,6 +164,7 @@ class AnthropicMessagesTransport:
         self.extra = extra or {}
         self.max_tokens = max_tokens
         self.version = version
+        self.sleep = sleep or time.sleep     # how the loop waits between retries
         if any(k in self.extra for k in PRIVATE_BLOCKS):
             raise ValueError(
                 "this transport does not support extended thinking: the harness never reads "
@@ -179,7 +182,8 @@ class AnthropicMessagesTransport:
                 payload = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", errors="replace")[:500]
-            raise TransportError(f"HTTP {e.code}: {detail}") from e
+            raise TransportError(f"HTTP {e.code}: {detail}",
+                                 retry_after=retry_after_seconds(e.headers, e.code)) from e
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
             raise TransportError(str(e)) from e
         return normalize_messages(payload)

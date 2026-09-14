@@ -12,7 +12,8 @@ statuses — so a run can be driven end to end against
 
 Script entries, tried in this order:
 
-  HttpError(status, message)   respond with that HTTP status and an error body
+  HttpError(status, message,   respond with that HTTP status and an error body,
+            retry_after)       with a Retry-After header when one is given
   callable                     called with the parsed request body, returns a
                                full wire payload
   dict with "choices"          served as-is (raw wire payload)
@@ -67,11 +68,18 @@ class Headers(dict):
 
 
 class HttpError:
-    """Script entry: make the server answer with an HTTP error."""
+    """Script entry: make the server answer with an HTTP error.
 
-    def __init__(self, status: int, message: str = "mock error") -> None:
+    ``retry_after`` becomes a ``Retry-After`` header, which is how a real 429
+    or 529 says how long to wait; it is sent verbatim, so a test can also send
+    something unparseable and watch the transport fall back to its schedule.
+    """
+
+    def __init__(self, status: int, message: str = "mock error",
+                 retry_after: Any = None) -> None:
         self.status = status
         self.message = message
+        self.retry_after = retry_after
 
 
 def chat_completion_payload(resp: dict, model: str, index: int = 0) -> dict:
@@ -154,11 +162,13 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:  # keep test output clean
         pass
 
-    def _send(self, status: int, payload: dict) -> None:
+    def _send(self, status: int, payload: dict, headers: dict | None = None) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -185,7 +195,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(503, {"error": {"message": "mock script exhausted"}})
             return
         if isinstance(entry, HttpError):
-            self._send(entry.status, {"error": {"message": entry.message}})
+            extra = {"Retry-After": str(entry.retry_after)} if entry.retry_after is not None else None
+            self._send(entry.status, {"error": {"message": entry.message}}, extra)
             return
         if callable(entry):
             self._send(200, entry(body))

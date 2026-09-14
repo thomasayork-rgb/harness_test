@@ -159,6 +159,33 @@ def test_transport_error_retries_once_then_fails(tmp_path):
     fake2 = FakeTransport([TransportError("blip"), {"content": "", "tool_calls": [
         todo(("1", "x", "completed")), call("final_answer", {"status": "completed", "content": "ok"})]}])
     assert AgentRuntime(registry_with(1), fake2, tmp_path, "fake").run("t").status == "completed"
+    assert fake2.delays == [1]                      # it waited before trying again
+
+
+def test_retries_wait_before_trying_again(tmp_path):
+    """Hammering an endpoint that just failed is how a rate limit becomes a
+    dead run. The wait goes through the transport, so this asserts the
+    schedule rather than living through it."""
+    done = [todo(("1", "x", "completed")), call("final_answer", {"status": "completed", "content": "ok"})]
+    fake = FakeTransport([TransportError("down"), TransportError("still down"),
+                          {"content": "Back.", "tool_calls": done}])
+    res = AgentRuntime(registry_with(1), fake, tmp_path, "fake",
+                       RuntimeConfig(transport_retries=2), run_id="backoff").run("t")
+    assert res.status == "completed" and len(fake.requests) == 3
+    assert fake.delays == [1, 4]                    # first retry, then every later one
+
+    # what the provider asked for wins over the schedule, and nothing is
+    # waited after the last attempt
+    slow = FakeTransport([TransportError("rate limited", retry_after=2.5),
+                          TransportError("still rate limited", retry_after=7)])
+    res = AgentRuntime(registry_with(1), slow, tmp_path, "fake",
+                       RuntimeConfig(transport_retries=2), run_id="asked").run("t")
+    assert res.status == "transport_error" and slow.delays == [2.5, 7]
+
+    patient = FakeTransport([TransportError("down")])
+    res = AgentRuntime(registry_with(1), patient, tmp_path, "fake",
+                       RuntimeConfig(transport_retries=0), run_id="once").run("t")
+    assert res.status == "transport_error" and patient.delays == []
 
 
 def test_step_cap_and_default(tmp_path):
