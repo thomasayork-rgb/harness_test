@@ -79,10 +79,11 @@ python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 
 python -m harness --runs-dir RUNS bench TASKS.jsonl ...     # a file of tasks, one table, bench.jsonl
 python -m harness map scaffold --project P [--package PKG]  # write or refresh docs/map/
 python -m harness map stale --project P [--area PKG] [--json]  # exit 1 if the map is behind
+python -m harness tasks list|next|show ID --project P       # the project's own work list
 python -m harness --runs-dir RUNS worktree list|prune --project P   # the worktrees of that project's runs
 python -m harness tools [--tools SPEC]                      # what the agent can discover
 python -m harness skills [--skills DIR] [--workdir W]      # what the agent can load
-python -m harness prompt [--sources]                        # the system prompt a run would start with
+python -m harness prompt [--sources] [--project P [--task-id ID]]   # the prompt a run would start with
 ```
 
 `--runs-dir` is a global option and goes **before** the subcommand. `resume` defaults `--endpoint`, `--provider`, `--workdir`, `--tools`, `--extra-body`, `--max-tokens`, `--timeout` and the policy to what the run recorded in its trajectory header (`invocation`); an explicit flag overrides. The API key is never recorded, and prompt flags are refused. Replaying a run that edited files needs a pristine workdir. For experiments, point `--runs-dir` and `--workdir` at scratch space, never at the repo.
@@ -104,7 +105,45 @@ puts a marker in its place. The header records the directories and names, `resum
 from `invocation`, and `replay` rediscovers them, so a recorded skills run is still a regression
 test. A project skill (one found in `<workdir>/.harness/skills`) that declares a `plugin` is refused
 at load unless the run has `--trust-project-plugins`: that plugin is the project's own code, and
-the harness never runs it on the operator's say-so alone.
+the harness never runs it on the operator's say-so alone. Three skills ship inside the package
+(`harness/skills_bundled/`) and are discovered only for a `--project` run, at the lowest precedence
+there is; wherever a location is recorded theirs is the string `bundled`, which `discover` reads
+back, so a recorded project run still resumes and replays.
+
+### Projects
+
+```python
+from tests.gitfixture import commit_all, git, git_repo, sample_project, write
+
+repo = sample_project(tmp_path / "p")        # two packages, a subpackage, a namespace dir, tasks/
+scaffold(repo); write(...); commit_all(repo, "map the project")   # a committed map to work from
+```
+
+Then drive it through the CLI, in-process or as a real process:
+
+```bash
+python -m harness --runs-dir RUNS run --project REPO --task-id ID --run-id r1 \
+  --model mock-model --endpoint $SERVER --test-command 'python3 -m pytest -q' \
+  [--allow-dirty] [--allow-git] [--force] [--no-auto-commit] [--no-keep-worktree]
+```
+
+Every git call in a fixture goes through `tests/gitfixture.py` (identity on the command line,
+`GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`). The run works in `RUNS/r1/wt` on branch
+`task/r1`; the task file in the **project** says `doing` before the first request and `done` (or
+`blocked`) after; the header carries `project` and the prompt gains the `project` and `task` layers.
+
+`AgentRuntime(..., hooks=RunHooks(verify, finish))` is what runs between the last step and the
+footer: `verify(runtime)` only when a final answer was accepted, `finish(runtime, status)` at every
+terminal status, each returning the dict that becomes `footer["verify"]` / `footer["commit"]`. A
+hook that raises is recorded as `{"error": ...}` and the footer is written anyway, so a test can
+hand in a hook that raises and still read the run back. `harness.finish.project_hooks(project, ...)`
+is the pair a project run gets: the test command (`--test-command`, or `.harness/project.json` only
+with `--trust-project-plugins`), `stale_against_tree` for the task's area, then `git add -A` and one
+commit named `harness: <task or run> — <status>`. Auto-commit means a finished worktree is clean, so
+a test that wants a dirty one passes `--no-auto-commit`.
+
+When a scaffolded map's prose changes, `docs/map/INDEX.md` only says so after another `map scaffold`:
+the index is generated from the map files. Write the Purpose, then scaffold.
 
 ### Plugins and policy
 
@@ -126,15 +165,19 @@ harness/
   plugins.py       --tools loading
   project.py       --project worktrees, dirty rules, git denials, worktree list|prune
   codemap.py       docs/map/ scaffolding and staleness (stale against HEAD, stale_against_tree)
+  tasks.py         tasks/<id>.md: load, claim (doing), close (done/blocked), tasks list|next|show
+  finish.py        the hooks of a project run: the test command, the map check, the auto-commit
   frontmatter.py   the --- block: parse_frontmatter, dump, split_frontmatter
-  skills.py        SKILL.md frontmatter, discovery, SkillSet (--skills)
+  skills.py        SKILL.md frontmatter, discovery, SkillSet (--skills), the bundled location
+  skills_bundled/  orient, map, handoff: shipped in the package, only for a --project run
   mockserver.py    MockOpenAIServer, MockAnthropicServer for tests
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
-  prompts.py       prompt layers (built-in, global file, appends) and the nudge
-  cli.py           run / resume / bench / map / worktree / skills / tools / prompt / trace / replay
+  prompts.py       prompt layers (built-in, global file, appends, project, task) and the nudge
+  cli.py           run / resume / bench / map / tasks / worktree / skills / tools / prompt / trace / replay
   tools/           paths.py (rooting), basic.py, search.py, edit.py, scratch.py
 examples/          global-system.md: an example global prompt
-                   skills/: investigate, code-change, final-report
-tests/             one module per area; the *_http and anthropic tests are the only real-HTTP tests
+                   skills/: investigate, code-change, final-report (the bundled three are in
+                   harness/skills_bundled/, and read as examples too)
+tests/             one module per area; the *_http, anthropic and *_e2e tests are the real-HTTP ones
                    gitfixture.py: fixture repositories for --project (see the rule below)
 ```

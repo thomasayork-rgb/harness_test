@@ -20,11 +20,14 @@ python -m harness run \
   --endpoint http://localhost:8080/v1 \
   --workdir ./project
 
-python -m harness run --project ./repo --task "..." --model m --endpoint http://localhost:8080/v1
+python -m harness run --project ./repo --task-id fix-the-port --model m --endpoint ...
 python -m harness resume <run_id> --step-cap 400        # same flags as before, from the recording
 python -m harness bench tasks.jsonl --model m --endpoint http://localhost:8080/v1
 python -m harness map scaffold --project ./repo         # write or refresh docs/map/
 python -m harness map stale --project ./repo [--json]   # what the map no longer describes
+python -m harness tasks list --project ./repo           # id, status, area, branch
+python -m harness tasks next --project ./repo           # the first one still to do
+python -m harness tasks show fix-the-port --project ./repo
 python -m harness worktree list --project ./repo        # the worktrees this runs dir holds
 python -m harness worktree prune --project ./repo       # remove the ones of finished runs
 python -m harness tools                       # what the agent can discover
@@ -36,11 +39,11 @@ python -m harness trace <run_id> --summary    # status, kinds, per-tool counts, 
 python -m harness replay <run_id> --workdir ./project   # re-run a recording against today's tools
 ```
 
-`--api-key` or `HARNESS_API_KEY` for hosted endpoints. Runs land in `./runs/<run_id>/` (`--runs-dir` to move). Exit codes for `run` and `resume`: `0` completed, `1` blocked/failed, `2` transport_error, `3` step_cap, `4` stalled, `130` interrupted (Ctrl-C). For `replay`: `0` identical to the recording, `1` drifted. For `bench`: `0` if every task completed, `1` otherwise. For `map stale`: `0` clean, `1` stale. A bad command line — including a run that cannot be resumed — is `64`, an unreadable run directory `66`.
+`--api-key` or `HARNESS_API_KEY` for hosted endpoints. Runs land in `./runs/<run_id>/` (`--runs-dir` to move). Exit codes for `run` and `resume`: `0` completed, `1` blocked/failed, `2` transport_error, `3` step_cap, `4` stalled, `130` interrupted (Ctrl-C). For `replay`: `0` identical to the recording, `1` drifted. For `bench`: `0` if every task completed, `1` otherwise. For `map stale`: `0` clean, `1` stale. For `tasks next`: `1` when nothing is to do. A bad command line — including a run that cannot be resumed, or a task another run is already on — is `64`, an unreadable run directory `66`.
 
 Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--skills ./skills` (repeatable), `--skill-chars 12000`, `--progress-nudge 12`, `--trust-project-plugins`, `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
 
-`--project PATH` points a run at a git repository instead of a directory: it gets a worktree of its own at `<runs-dir>/<run_id>/wt`, cut from HEAD on branch `task/<run_id>`, and that worktree is the workdir (so `--project` and `--workdir` are mutually exclusive). The project must be committed first — the worktree is cut from HEAD, so uncommitted work is invisible to the agent, and uncommitted `docs/map/` most of all; changes under `tasks/` are ignored and `--allow-dirty` overrides the check. A project run also denies the git that reaches past its worktree (`git push`, `checkout`, `switch`, `reset --hard`, `worktree`, `branch -D`) as ordinary policy denials, which `--allow-git` lifts. `harness map scaffold --project PATH [--package PKG]` writes the project's code map: `docs/map/<dotted.package>.md` per package — generated frontmatter (files, loc, imports, public names, who imports it, and the git blob sha each of those was read from) above prose a reader writes, which a refresh keeps byte for byte — plus `docs/map/INDEX.md`, one line per package with the first line of its Purpose. It is deterministic: same tree, same bytes, no timestamps. `harness map stale --project PATH [--area PKG] [--json]` says which packages the map no longer describes — a file that changed since the frontmatter was written, a file HEAD has and the map does not, no map file, or no Purpose — against HEAD, so an editor full of unsaved opinions changes nothing; exit `1` if any package is stale, `0` if none. `--area` (repeatable) narrows it to a package and its subpackages. `--no-keep-worktree` removes the worktree after a finished run, keeping the branch; a worktree with uncommitted changes is left alone. The header records a `project` block (`path`, `base_sha`, `branch`, `worktree`, `task_id`), so `resume` continues in the same worktree — or, if it is gone, cuts it again from the branch and tells the model that whatever was uncommitted in it is gone.
+`--project PATH` points a run at a git repository instead of a directory: it gets a worktree of its own, a branch, a code map to read, a task to do and a commit at the end. See [Project](#project).
 
 ## Run directory
 
@@ -56,7 +59,7 @@ runs/<run_id>/
 
 Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step, notes included. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, `skills` (the directories searched and the names found), `project` (the repository, base commit, branch and worktree of a `--project` run, or `null`), and `invocation`: the endpoint, provider, workdir, `--tools` modules, skill directories and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
 
-Two other record types sit in the same file. A `note` record — `{"type": "note", "step", "kind", "text"}` — is something the loop said to the model that is not a step: the progress nudge (`kind: "progress_nudge"`) and the budget warning (`kind: "budget"`, once per crossing, when protected results alone exceed `--context-chars`). It does not count toward the step cap; `format_trace` prints it at the seam and `trace --summary` counts it. The footer carries `todos`: the todo list as it stood when the run ended, with its notes, whether or not there was a final answer.
+Two other record types sit in the same file. A `note` record — `{"type": "note", "step", "kind", "text"}` — is something the loop said to the model that is not a step: the progress nudge (`kind: "progress_nudge"`) and the budget warning (`kind: "budget"`, once per crossing, when protected results alone exceed `--context-chars`). It does not count toward the step cap; `format_trace` prints it at the seam and `trace --summary` counts it. The footer carries `todos`: the todo list as it stood when the run ended, with its notes, whether or not there was a final answer — plus `verify` and `commit`, what the finish hooks made of the run, or `null` (see [Project](#project)).
 
 ## Failure semantics
 
@@ -96,6 +99,8 @@ header  step*  footer  [resume  step*  footer]*
 
 One footer per segment — each says how that segment ended — with a `resume` record between segments carrying `from_status`, `from_step`, `from_detail`, and the `model`, `step_cap`, `config`, `policy` and `invocation` the next segment runs under — so the segment after that defaults to them in turn. The last footer is the run's answer; earlier ones are history. `read_trajectory` returns the lot; `summarize` totals every segment and reads its status from the last footer (plus `segments` and `resumed_from`, and wall time summed per segment so the hours a run sat waiting are not counted); `format_trace` prints the seam where it happened; `ReplayTransport` reads a resumed recording as one straight run under the configuration the last segment ended with, so a raised cap replays as a raised cap.
 
+A resumed segment ends the way any other does: a project run verifies and commits again when it stops, so a run that took three attempts still leaves its work on the branch, and the recorded `test_command`, `test_timeout` and `auto_commit` are what it uses (see [Project](#project)).
+
 Resuming appends one user message saying what happened, which also leaves the transcript ending on a user turn however the segment died. From Python:
 
 ```python
@@ -112,6 +117,8 @@ Three layers, joined with a blank line:
 | base | the built-in prompt, or `--system-prompt FILE` instead of it |
 | global | the first of `$HARNESS_SYSTEM_PROMPT`, `$XDG_CONFIG_HOME/harness/system.md`, `~/.config/harness/system.md` that exists — unless `--no-global-prompt` |
 | append | each `--append-system-prompt FILE`, in the order given |
+| project | `--project`: how a mapped repository is worked on, plus the head of its `docs/map/INDEX.md` (see [Project](#project)) |
+| task | `--task-id`: that task's `done_when`, as the checks `final_answer` has to show evidence for |
 
 The built-in prompt teaches the mechanics the loop enforces (discovery, the todo gate, think-before-act, reading
 errors, denials, eviction and the scratch pad, the file-tool patterns, what `final_answer.content` is for) and
@@ -193,6 +200,7 @@ Discovery merges every location that exists, lowest precedence first:
 
 | where | what for |
 |---|---|
+| `harness/skills_bundled` (`--project` runs only) | orient, map, handoff: working in a mapped repository (see [Project](#project)) |
 | `$XDG_CONFIG_HOME/harness/skills`, else `~/.config/harness/skills` | skills for every run on this machine |
 | `$HARNESS_SKILLS` (`os.pathsep`-separated) | skills for this shell |
 | `<workdir>/.harness/skills` | skills that live with the project |
@@ -204,6 +212,7 @@ not be read. Nothing is loaded into context at discovery.
 
 ```bash
 python -m harness skills --skills ./skills --workdir ./project [--filter kw]
+python -m harness skills --project ./repo             # what a project run would see, bundled included
 python -m harness run --skills ./skills ...
 ```
 
@@ -235,7 +244,163 @@ sent before, byte for byte.
 
 `examples/skills/` ships three to copy or point `--skills` at: `investigate` (answer a question
 about a codebase with evidence), `code-change` (find it, read it, edit it exactly, run the project's
-tests) and `final-report` (what belongs in `final_answer.content`).
+tests) and `final-report` (what belongs in `final_answer.content`). `harness/skills_bundled/` ships
+three more that a `--project` run gets without asking; they are worth reading as examples too.
+
+## Project
+
+A project is a git repository with a code map in it, and work written down as tasks.
+
+```bash
+python -m harness map scaffold --project ./repo               # write or refresh docs/map/
+python -m harness tasks next --project ./repo                 # what to do
+python -m harness run --project ./repo --task-id fix-the-port \
+  --model <model-id> --endpoint http://localhost:8080/v1 --test-command 'python3 -m pytest -q'
+python -m harness --runs-dir runs worktree list --project ./repo
+```
+
+### The worktree
+
+`--project PATH` and `--workdir` are mutually exclusive: the run's workdir is a worktree the harness
+cuts for it at `<runs-dir>/<run_id>/wt`, from HEAD, on branch `task/<run_id>`. The operator's
+checkout is never the agent's; two runs cannot collide; and what a run did is a branch someone can
+read, keep or delete.
+
+The project has to be committed first — the worktree is cut from HEAD, so uncommitted work is
+invisible to the agent, and uncommitted `docs/map/` most of all, which the refusal says out loud.
+Changes under `tasks/` are ignored (that is the harness's own bookkeeping) and `--allow-dirty`
+overrides the check. A project run also denies the git that reaches past its worktree — `git push`,
+`checkout`, `switch`, `reset --hard`, `worktree`, `branch -D` — as ordinary policy denials the model
+reads and routes around; `--allow-git` lifts them.
+
+`--no-keep-worktree` removes the worktree after a finished run, keeping the branch; with
+`--no-auto-commit` it may have uncommitted work in it, and then it is left alone.
+`harness worktree list --project P` is one line per worktree under the runs directory (run, status,
+branch, dirty, path) and `worktree prune --project P` removes the ones of finished runs, keeping
+their branches — skipping runs that can still be resumed, and dirty ones unless `--force`.
+
+### The code map
+
+`harness map scaffold --project PATH [--package PKG]` writes `docs/map/<dotted.package>.md`, one per
+package: generated frontmatter above prose a reader writes, which a refresh keeps byte for byte.
+
+```
+---
+map_version: 1
+package: harness.tools
+files: [harness/tools/__init__.py, harness/tools/basic.py, ...]
+loc: 412
+imports:
+  internal: [harness.registry]            # what this package depends on, itself excluded
+  external: [os, pathlib, subprocess]
+public:
+  "harness/tools/basic.py": [child_env, kill_group, register_basic_tools]
+inbound_refs:
+  count: 4
+  callers:
+    harness.cli: 3
+generated_from:
+  "harness/tools/basic.py": <git blob sha>
+---
+
+## Purpose ... ## Entry points ... ## Invariants ... ## Gotchas ... ## Depends on ... ## Depended on by
+```
+
+Plus `docs/map/INDEX.md`: `- <package> (inbound n): <first line of its Purpose>`, grouped by
+top-level package, most depended-on first, `[stale]` where there is no map file or no Purpose. It is
+deterministic — same tree, same bytes, no timestamps — and it is regenerated from the map files, so
+**write the Purpose, then scaffold again** for the index to say it.
+
+`harness map stale --project PATH [--area PKG] [--json]` says which packages the map no longer
+describes: a file that changed since the frontmatter was written, a file HEAD has and the map does
+not, no map file, or no Purpose. It asks HEAD, not the working tree, so an editor full of unsaved
+opinions changes nothing; exit `1` if any package is stale. `--area` (repeatable) narrows it to a
+package and its subpackages.
+
+### Tasks
+
+`tasks/<id>.md` in the project: frontmatter, and a body that is the prompt.
+
+```markdown
+---
+status: todo                                    # todo | doing | done | blocked
+area: [harness.tools]                           # the packages it is about
+done_when: [tests pass, the map for harness.tools is current]
+branch: null
+run_id: null
+---
+Make run_shell kill the process group on a timeout.
+```
+
+`harness tasks list|next|show ID --project PATH` reads them (`next` is the first `todo` by id, exit
+`1` if there is none). `harness run --project P --task-id ID` runs that body — mutually exclusive
+with `--task` and `--task-file` — and writes the frontmatter back to the **project's** copy: `doing`
+with the branch and run id before the first request, then `done` on `completed`, `blocked` on
+`blocked` or `failed`, and left `doing` after an interruption a resume can pick up (the resume closes
+it). A task already `doing` is refused with exit `64` unless `--force`: two runs on one task
+overwrite each other's branch in the file.
+
+### What the model is told
+
+Two prompt layers after the appends (see [System prompt](#system-prompt)):
+
+| layer | content | source recorded |
+|---|---|---|
+| project | read the index first; map what is stale before changing it; update the map before `final_answer`; the harness does the git — then the 20 most depended-on packages of `INDEX.md` plus every package in the task's area, in index order, and `fs_read docs/map/INDEX.md for the rest.` | `<project>/docs/map/INDEX.md` |
+| task | `Before final_answer show evidence for each of these checks:` and the task's `done_when` | `<project>/tasks/<id>.md` |
+
+The project layer is capped at `--project-prompt-chars` (default 6000) by dropping excerpt lines from
+the bottom; a project with no `INDEX.md` gets the other half of the instruction — map it before you
+change it. `harness prompt --project PATH [--task-id ID] [--sources]` prints what a run would start
+with.
+
+Three skills ship inside the package and are discovered **only** for a `--project` run, at the lowest
+precedence there is (a project's own `map` skill wins): `orient` (index, then map files, then code),
+`map` (how to write one map file's prose) and `handoff` (what `final_answer` must contain). Wherever
+a skills location is recorded — the header, `harness skills --project P`, the `invocation` a resume
+reads back — theirs is the word `bundled`, not wherever the package is installed.
+
+### What the harness does at the end
+
+Between the last step and the footer, a project run verifies and then commits. Neither can change the
+run's status: the model said what it thinks, the footer says what the machine found.
+
+```json
+"verify": {"test": {"source": "--test-command", "command": "python3 -m pytest -q", "passed": false,
+                    "exit": 1, "timed_out": false, "elapsed_ms": 4120,
+                    "artifact": "artifacts/verify_test.txt"},
+           "map_stale": {"area": ["harness.tools"], "stale": [], "clean": true}}
+"commit": {"sha": "9f3c...", "message": "harness: fix-the-port — completed", "files": 3}
+```
+
+`verify` runs only when a final answer was accepted. The test command is `--test-command CMD`
+(the operator's, trusted) or the `test` in the worktree's `.harness/project.json`, which is the
+project's own code and runs only with `--trust-project-plugins` (a note on stderr says when one was
+there and was not run). It runs in the worktree with the same environment `run_shell` gets — this
+process's minus every `HARNESS_*` — in its own session, under `--test-timeout` (default 600, or that
+file's `timeout`), and a timeout kills the whole process group. Its output goes to
+`artifacts/verify_test.txt` and nowhere else; the footer carries the result. `map_stale` asks the
+same question `map stale` does, but of the worktree's working files, for the task's `area` — or, with
+no task, for every package the run changed.
+
+`commit` is the work: if the worktree is dirty, `git add -A` and one commit on the task branch,
+message `harness: <task-id or run-id> — <status>`, with the repository's git identity or
+`harness <harness@local>` when it has none. It happens at every terminal status, `interrupted`
+included — a run whose work is only on disk in a worktree someone will prune is a run that did not
+happen — and again on each resumed segment. `--no-auto-commit` opts out. It is `git add -A`, so a
+project that does not ignore its build output will find that output in the commit.
+
+`trace --summary` prints both:
+
+```
+verify: tests passed (exit 0, 1.4 s, artifacts/verify_test.txt)  map clean for harness.tools
+commit: 9f3ca1b2c3d4  harness: fix-the-port — completed  (3 file(s))
+```
+
+`AgentRuntime(..., hooks=RunHooks(verify=..., finish=...))` is the general form: `verify(runtime)` is
+called when a final answer was accepted, `finish(runtime, status)` at every terminal status, each
+returning the dict that becomes its footer block. A hook that raises — git gone, Ctrl-C during the
+tests — is recorded as `{"error": "..."}` there, and the footer is written anyway.
 
 ## Plan, notes and the progress nudge
 
@@ -389,9 +554,11 @@ python -m pytest -q
 
 `tests/test_runtime.py::test_scripted_end_to_end_matches_jsonl_step_for_step` drives a fake transport through list → add → inspect → todo → rejected final → close → accepted final and asserts the JSONL step for step. Use `harness.transport.FakeTransport` the same way to test your own tools without a model.
 
-`tests/test_e2e_http.py` runs `python -m harness run` as a subprocess against the mock server and asserts the exit code, the run directory, the trajectory, the artifacts, and the guarantees on the wire. `tests/test_tools_fs.py` exercises each file tool through the runtime, error paths included; `tests/test_plugins.py` covers `--tools`; `tests/test_replay.py` records a run, replays it, and asserts the trajectories match step for step; `tests/test_resume.py` caps a run, kills one with a transport error, stalls one, Ctrl-Cs one (a real SIGINT to a real `harness run`), takes one over from a stale lock and refuses one held by a live pid, resuming each and checking the seams; `tests/test_anthropic.py` asserts the Messages API wire format request by request; `tests/test_policy.py` and `tests/test_scratch.py` drive the denials and the pad through the runtime; `tests/test_prompts.py` covers the prompt layers, the provenance and `harness prompt` (with `HOME`, `XDG_CONFIG_HOME` and `HARNESS_SYSTEM_PROMPT` pointed at temporary directories, never the real ones); `tests/test_bench.py` benches two tasks over the mock server; `tests/test_skills.py` covers the frontmatter, discovery and precedence, the three meta-tools through the runtime, `harness skills`, and a CLI run with `--skills` over HTTP; `tests/test_progress.py` covers todo notes, the nudge and the footer todos.
+`tests/test_e2e_http.py` runs `python -m harness run` as a subprocess against the mock server and asserts the exit code, the run directory, the trajectory, the artifacts, and the guarantees on the wire. `tests/test_tools_fs.py` exercises each file tool through the runtime, error paths included; `tests/test_plugins.py` covers `--tools`; `tests/test_replay.py` records a run, replays it, and asserts the trajectories match step for step; `tests/test_resume.py` caps a run, kills one with a transport error, stalls one, Ctrl-Cs one (a real SIGINT to a real `harness run`), takes one over from a stale lock and refuses one held by a live pid, resuming each and checking the seams; `tests/test_anthropic.py` asserts the Messages API wire format request by request; `tests/test_policy.py` and `tests/test_scratch.py` drive the denials and the pad through the runtime; `tests/test_prompts.py` covers the prompt layers, the provenance and `harness prompt` (with `HOME`, `XDG_CONFIG_HOME` and `HARNESS_SYSTEM_PROMPT` pointed at temporary directories, never the real ones); `tests/test_bench.py` benches two tasks over the mock server; `tests/test_skills.py` covers the frontmatter, discovery and precedence, the three meta-tools through the runtime, `harness skills`, and a CLI run with `--skills` over HTTP; `tests/test_progress.py` covers todo notes, the nudge and the footer todos. On the project side: `tests/test_frontmatter.py` round-trips the `---` block and every shipped skill file; `tests/test_project.py` cuts worktrees, refuses dirty trees and resumes into pruned ones; `tests/test_codemap.py` scaffolds the map twice and asserts the same bytes; `tests/test_tasks.py` claims and closes task files; `tests/test_project_prompt.py` covers the project and task prompt layers, the cap and the bundled skills; `tests/test_finish.py` drives verify and auto-commit through the runtime, timeout and untrusted `project.json` included. Every test that needs a repository builds it with `tests/gitfixture.py`, which passes a fixture identity on the command line and runs with `GIT_CONFIG_GLOBAL=/dev/null`, so the machine's own git configuration cannot change what a test sees.
 
 `tests/test_e2e_complex.py` is the one that reads as the whole point: one real `python -m harness run` in which the model lists its skills, loads two of them, plans four todos, does the work with the file tools, records each outcome in a note, is nudged once for ignoring its plan, brings the plan back and finishes — asserted step for step, with the footer todos and the `trace --summary` a reader would run afterwards.
+
+`tests/test_project_e2e.py` is the same for a project: one real `harness run --project P --task-id ID` in which the model loads the bundled `orient`, reads `INDEX.md` and a map file before the code, changes a package, refreshes its map with `harness map scaffold`, loads `handoff` and reports — and then the harness runs the tests, checks the map, commits the worktree on the task branch and marks the task done.
 
 ## Layout
 
@@ -410,11 +577,14 @@ harness/
   plugins.py       --tools module loading
   project.py       --project: worktrees, the dirty rules, the git denials, worktree list|prune
   codemap.py       docs/map/: the scan, the generated frontmatter, INDEX.md, staleness
+  tasks.py         tasks/<id>.md: the work list a run claims and closes
+  finish.py        a project run's hooks: the test command, the map check, the commit
   frontmatter.py   the --- block: parse, dump, split (shared by skills and the project files)
   skills.py        SKILL.md frontmatter, discovery, SkillSet
+  skills_bundled/  orient, map, handoff: the skills a --project run is given
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
-  prompts.py       the prompt layers: built-in, global file, appends
-  cli.py           run / resume / bench / map / worktree / skills / tools / prompt / trace / replay
+  prompts.py       the prompt layers: built-in, global file, appends, project, task
+  cli.py           run / resume / bench / map / tasks / worktree / skills / tools / prompt / trace / replay
   tools/basic.py   fs_list, fs_read, fs_write, run_shell (rooted to --workdir)
   tools/search.py  fs_search, fs_glob
   tools/edit.py    fs_edit
