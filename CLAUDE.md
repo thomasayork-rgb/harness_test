@@ -52,7 +52,7 @@ res = rt.run("Find the port")                            # policy=ToolPolicy(...
 steps = [r for r in read_trajectory(res.run_dir) if r["type"] == "step"]
 ```
 
-Assert on each step's `tool`, `kind` (`ok | error | denied | final_accepted | final_rejected | text_only`), `result_preview` and artifact file, and on `fake.requests[i]["tools"]` for what was in context on request `i`. A script entry that is an `Exception` instance is raised instead of returned (`TransportError(...)` for a transport failure). Several `tool_calls` in one entry make one turn with several steps; `call()` generates a unique id for each, so pass an explicit `id=` only when a test wants to name a call.
+Assert on each step's `tool`, `kind` (`ok | error | denied | final_accepted | final_rejected | text_only`), `result_preview` and artifact file, and on `fake.requests[i]["tools"]` for what was in context on request `i`. A script entry that is an exception instance is raised instead of returned (`TransportError(...)` for a transport failure, `KeyboardInterrupt()` to drive the interrupt path). Several `tool_calls` in one entry make one turn with several steps; `call()` generates a unique id for each, so pass an explicit `id=` only when a test wants to name a call.
 
 ### Real process over HTTP (integration level)
 
@@ -73,7 +73,7 @@ Same script shape as `FakeTransport`; `server.requests` records every wire reque
 python -m harness --runs-dir RUNS trace RUN_ID              # readable trace
 python -m harness --runs-dir RUNS trace RUN_ID --step 7     # one step in full, artifact included
 python -m harness --runs-dir RUNS trace RUN_ID --summary    # status, kinds, per-tool counts, tokens
-python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N]  # after transport_error, step_cap, stalled
+python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N] [--force]  # after transport_error, step_cap, stalled, interrupted; --force takes over a live lock
 python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
 python -m harness --runs-dir RUNS bench TASKS.jsonl ...     # a file of tasks, one table, bench.jsonl
 python -m harness tools [--tools SPEC]                      # what the agent can discover
@@ -113,7 +113,7 @@ harness/
   registry.py      ToolRegistry, ToolSpec, validate_args
   runtime.py       AgentRuntime, RuntimeConfig, meta-tools, todo gate, the loop, resume()
   todo.py          todo validation and merge
-  context.py       ContextBudget: per-result truncation, oldest-result eviction
+  context.py       ContextBudget: per-result truncation, oldest-result eviction, supersession of stale todo/skill results
   transport.py     Transport protocol, ChatCompletionsTransport, FakeTransport, call()
   anthropic.py     AnthropicMessagesTransport (stdlib only)
   policy.py        ToolPolicy: the pre-dispatch veto
