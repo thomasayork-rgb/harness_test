@@ -534,7 +534,8 @@ def build_parser() -> argparse.ArgumentParser:
     prompt_args(b)
     b.set_defaults(fn=_bench)
 
-    rs = sub.add_parser("resume", help="continue an interrupted run (transport_error, step_cap, stalled)")
+    rs = sub.add_parser("resume",
+                        help="continue an interrupted run (transport_error, step_cap, stalled, interrupted)")
     rs.add_argument("run_id")
     model_args(rs, model_required=False, recorded=True)
     rs.add_argument("--step-cap", type=int, default=None,

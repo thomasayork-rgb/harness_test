@@ -165,6 +165,7 @@ def pid_alive(pid: int) -> bool:
         return False
     return True
 
+
 RESUME_NOTE = ("This run was interrupted ({status}: {detail}) and has been resumed. "
                "The conversation above is yours; continue from it. Step {step} of {cap}.")
 

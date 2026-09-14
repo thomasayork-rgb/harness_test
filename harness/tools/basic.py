@@ -38,8 +38,10 @@ def kill_group(proc: subprocess.Popen) -> None:
     """
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.kill()      # the group is gone, or was never ours to signal
+    except (AttributeError, ProcessLookupError, PermissionError, OSError):
+        # AttributeError: no process groups here at all (Windows), so the best
+        # available is what this used to do - kill the command itself
+        proc.kill()
 
 
 def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
