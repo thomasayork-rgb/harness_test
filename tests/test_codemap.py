@@ -56,7 +56,7 @@ def test_the_frontmatter_says_what_is_true_about_the_tree(tmp_path):
     alpha = meta_of(repo, "alpha")
     assert alpha["map_version"] == "1" and alpha["package"] == "alpha"
     assert alpha["files"] == ["alpha/__init__.py", "alpha/core.py"]
-    assert alpha["imports"] == {"internal": ["alpha.core", "beta.util"], "external": ["os"]}
+    assert alpha["imports"] == {"internal": ["beta.util"], "external": ["os"]}
     assert alpha["public"] == {"alpha/__init__.py": ["Engine"],          # __all__ wins
                                "alpha/core.py": ["Engine", "VERSION", "build"]}
     # count is files outside the package; a caller's number is how many names of
@@ -66,7 +66,7 @@ def test_the_frontmatter_says_what_is_true_about_the_tree(tmp_path):
     assert "errors" not in alpha
 
     nested = meta_of(repo, "alpha.nested")
-    assert nested["imports"] == {"internal": ["alpha.core", "alpha.nested"], "external": []}
+    assert nested["imports"] == {"internal": ["alpha.core"], "external": []}
     assert nested["inbound_refs"] == {"count": "0"}        # no callers key when there are none
     assert nested["public"] == {"alpha/nested/deep.py": ["dive"]}   # the empty __init__ is left out
 
@@ -80,6 +80,22 @@ def test_the_frontmatter_says_what_is_true_about_the_tree(tmp_path):
     assert beta["inbound_refs"] == {"count": "1", "callers": {"alpha.core": "1"}}
     assert beta["errors"] == ["beta/broken.py"]            # it still counts everywhere else
     assert set(beta["generated_from"]) == set(beta["files"])
+
+
+def test_a_package_does_not_import_itself(tmp_path):
+    """``imports.internal`` is what a reader has to go and look at elsewhere,
+    so a package's own modules and subpackages are not in it - however much of
+    itself it imports."""
+    repo = sample_project(tmp_path / "p")
+    write(repo / "alpha" / "core.py",
+          "from alpha.nested.deep import dive\nfrom alpha import core\nfrom beta.util import helper\n")
+    scaffold(repo)
+    assert meta_of(repo, "alpha")["imports"]["internal"] == ["beta.util"]
+    # the subpackage's own `from . import ...` is gone; what its parent holds is not
+    assert meta_of(repo, "alpha.nested")["imports"]["internal"] == ["alpha.core"]
+    # ... and the package is still counted as a caller of the ones it imports
+    assert meta_of(repo, "alpha.nested")["inbound_refs"] == {"count": "1",
+                                                            "callers": {"alpha.core": "1"}}
 
 
 def test_generated_from_holds_the_sha_git_would_print(tmp_path):

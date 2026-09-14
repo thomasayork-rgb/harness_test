@@ -270,14 +270,22 @@ def scan(root: Any) -> Project:
 
 
 def frontmatter_for(project: Project, package: Package) -> dict:
-    """The generated half of a map file, in one fixed key order."""
+    """The generated half of a map file, in one fixed key order.
+
+    ``imports.internal`` is what this package depends on, so it leaves out the
+    package itself and its subpackages: a package importing its own modules is
+    how it is built, not something a reader has to go and look at.
+    """
     tops = {name.split(".")[0] for name in project.packages}
     internal: set[str] = set()
     external: set[str] = set()
     public: dict[str, list[str]] = {}
+    own = package.dotted + "."
     for module in sorted(package.modules, key=lambda m: m.rel):
         for imported in module.imports:
             top = imported.split(".")[0]
+            if imported == package.dotted or imported.startswith(own):
+                continue                         # itself and its subpackages: not a dependency
             if top in tops:
                 internal.add(imported)           # the module, not the symbol
             else:

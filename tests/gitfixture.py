@@ -92,8 +92,11 @@ PROJECT_FILES = {
         "def helper(sep):\n    return json.dumps({\"sep\": sep, \"root\": str(pathlib.Path('.'))})\n"),
     "beta/broken.py": "def oops(\n",
     "scripts/tool.py": "import alpha.core\n\nprint(alpha.core.VERSION)\n",
-    "tasks/first.md": "---\nstatus: todo\narea: [alpha]\n---\nMake the engine start.\n",
-    "tasks/second.md": "---\nstatus: todo\narea: [beta]\n---\nMake the helper helpful.\n",
+    "tasks/first.md": ("---\nstatus: todo\narea: [alpha]\n"
+                       "done_when: [alpha starts the engine, the map for alpha is current]\n"
+                       "branch: null\nrun_id: null\n---\n\nMake the engine start.\n"),
+    "tasks/second.md": ("---\nstatus: todo\narea: [beta]\ndone_when: [the helper is helpful]\n"
+                        "branch: null\nrun_id: null\n---\n\nMake the helper helpful.\n"),
     ".harness/project.json": '{"test": "python3 -c \\"import sys; sys.exit(0)\\"", "timeout": 30}\n',
     "README.md": "# sample project\n",
 }

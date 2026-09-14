@@ -1,9 +1,10 @@
 """CLI.
 
-  harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
+  harness run    --task "..." | --task-file f | --task-id ID  --model m
+                 --endpoint http://host:port/v1
                  [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
                  [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
-                 [--project PATH [--allow-dirty] [--no-keep-worktree] [--allow-git]]
+                 [--project PATH [--allow-dirty] [--no-keep-worktree] [--allow-git] [--force]]
   harness resume <run_id> [--step-cap N] [--progress-nudge N] [--force]
                  (provider, tools, skills and policy flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
@@ -12,6 +13,7 @@
   harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
   harness map    scaffold --project PATH [--package PKG]
   harness map    stale --project PATH [--area PKG] [--json]
+  harness tasks  list|next|show [ID] --project PATH
   harness worktree list|prune --project PATH [--force]
   harness trace  <run_id> [--step N | --summary]
   harness replay <run_id> [--workdir d] [--tools mod] [--deny-tool NAME]
@@ -20,8 +22,9 @@ Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
 transport_error, 3 step_cap, 4 stalled, 130 interrupted. For replay: 0 identical to the
 recording, 1 drifted. For bench: 0 if every task completed, 1 otherwise. A
 bad command line (no task, unloadable --tools, an unreadable prompt file, a
-run that cannot be resumed) is 64; an unreadable run directory is 66. For map
-stale: 0 when the map describes the tree, 1 when any package is out of date.
+run that cannot be resumed, a task that is already being worked on) is 64; an
+unreadable run directory is 66. For map stale: 0 when the map describes the
+tree, 1 when any package is out of date. For tasks next: 1 when nothing is to do.
 """
 from __future__ import annotations
 
@@ -46,6 +49,8 @@ from .resume import (prepare as prepare_resume, recorded_invocation, recorded_po
                      recorded_project)
 from .runtime import RESUMABLE, AgentRuntime, ResumeError, RuntimeConfig, new_run_id
 from .skills import SkillSet, discover, search_dirs
+from .tasks import (DOING, Task, TaskError, close as close_task, format_task, format_tasks,
+                    load as load_task, load_all as load_tasks, next_task, tasks_dir)
 from .tools import register_default_tools, register_scratch_tools
 from .trajectory import format_summary, format_trace, read_trajectory, summarize
 from .replay import replay as replay_run
@@ -201,18 +206,56 @@ def _build(a: argparse.Namespace, workdir: Path, run_id: str | None,
     return rt
 
 
-def _run(a: argparse.Namespace) -> int:
+def _task_source(a: argparse.Namespace) -> tuple[str, Task | None] | None:
+    """The task text this command line asks for, and the task file behind it.
+
+    Returns None after printing why the command line does not name exactly one
+    task. ``--task-id`` reads the project's own ``tasks/`` (see harness.tasks),
+    which is also where its status is written back.
+    """
+    given = [flag for flag, value in (("--task", a.task), ("--task-file", a.task_file),
+                                      ("--task-id", a.task_id)) if value]
+    if len(given) > 1:
+        print(f"run: {' and '.join(given)} given; a run has one task", file=sys.stderr)
+        return None
+    if not given:
+        print("run: need --task, --task-file or --task-id", file=sys.stderr)
+        return None
+    if a.task_id and not a.project:
+        print("run: --task-id needs --project: a task lives in the project's tasks/ directory",
+              file=sys.stderr)
+        return None
     if a.task_file:
-        task = Path(a.task_file).read_text(encoding="utf-8")
-    elif a.task:
-        task = a.task
-    else:
-        print("run: need --task or --task-file", file=sys.stderr)
-        return USAGE_ERROR
+        return Path(a.task_file).read_text(encoding="utf-8"), None
+    if a.task:
+        return a.task, None
+
+    task = load_task(repo_root(a.project), a.task_id)      # ProjectError/TaskError: caller reports
+    if task.status == DOING and not a.force:
+        print(f"run: task {task.id} is already 'doing' (branch {task.branch or '?'}, run "
+              f"{task.run_id or '?'}). Another run may still be on it; --force to take it over "
+              "anyway.", file=sys.stderr)
+        return None
+    if not task.prompt.strip():
+        print(f"run: task {task.id} has no prompt: {task.path} is frontmatter and nothing else",
+              file=sys.stderr)
+        return None
+    return task.prompt, task
+
+
+def _run(a: argparse.Namespace) -> int:
     if a.project and a.workdir:
         print("run: --project and --workdir are mutually exclusive: a project run works in a "
               "worktree the harness cuts for it", file=sys.stderr)
         return USAGE_ERROR
+    try:
+        chosen = _task_source(a)
+    except (ProjectError, TaskError, OSError) as e:
+        print(f"run: {e}", file=sys.stderr)
+        return USAGE_ERROR
+    if chosen is None:
+        return USAGE_ERROR
+    task, task_file = chosen
 
     project: ProjectRun | None = None
     run_id = a.run_id
@@ -221,7 +264,8 @@ def _run(a: argparse.Namespace) -> int:
         run_id = run_id or new_run_id()
         try:
             project = start_project(a.project, Path(a.runs_dir), run_id,
-                                    allow_dirty=a.allow_dirty, allow_git=a.allow_git)
+                                    allow_dirty=a.allow_dirty, allow_git=a.allow_git,
+                                    task_id=task_file.id if task_file else None)
         except ProjectError as e:
             print(f"run: {e}", file=sys.stderr)
             return USAGE_ERROR
@@ -244,9 +288,20 @@ def _run(a: argparse.Namespace) -> int:
         if project:
             project.abandon()
         return USAGE_ERROR
+    if task_file is not None and project is not None:
+        # the project's copy says the task is taken, before the first request
+        try:
+            task_file = task_file.mark(DOING, branch=project.branch, run_id=rt.run_id)
+        except TaskError as e:
+            print(f"run: {e}", file=sys.stderr)
+            project.abandon()
+            return USAGE_ERROR
+        print(f"task {task_file.id}: doing  ({task_file.path})", file=sys.stderr)
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
     res = rt.run(task)
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
+    if task_file is not None:
+        _close_task(task_file, res.status)
     if project and not a.keep_worktree and res.status not in RESUMABLE:
         try:
             print(project.release(), file=sys.stderr)
@@ -255,6 +310,18 @@ def _run(a: argparse.Namespace) -> int:
     if res.final:
         print(res.final.get("content", ""))
     return EXIT.get(res.status, 1)
+
+
+def _close_task(task: Any, status: str) -> None:
+    """Write what the run's status means back to the task file, and say so. A
+    task that cannot be written is reported, never fatal: the run is over."""
+    try:
+        line = close_task(task, status)
+    except TaskError as e:
+        print(f"task: {e}", file=sys.stderr)
+        return
+    print(line if line else f"task left 'doing': the run ended as {status} and can be resumed",
+          file=sys.stderr)
 
 
 BENCH_FILE = "bench.jsonl"
@@ -420,9 +487,41 @@ def _resume(a: argparse.Namespace) -> int:
         print(f"resume: {e}", file=sys.stderr)
         return USAGE_ERROR
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
+    if project and project.get("task_id"):
+        # the same mapping a run does: this segment is what finished the task
+        _close_task(tasks_dir(project["path"]) / f"{project['task_id']}.md", res.status)
     if res.final:
         print(res.final.get("content", ""))
     return EXIT.get(res.status, 1)
+
+
+def _tasks(a: argparse.Namespace) -> int:
+    """The project's own tasks: what there is, what is next, what one says."""
+    try:
+        repo = repo_root(a.project)
+        found, errors = load_tasks(repo)
+        for line in errors:
+            print(f"tasks: {line}", file=sys.stderr)
+        if a.tasks_cmd == "next":
+            task = next_task(repo)
+            if task is None:
+                print(f"no task with status 'todo' in {tasks_dir(repo)}", file=sys.stderr)
+                return 1
+            print(task.id)
+            print(task.prompt)
+            return 0
+        if a.tasks_cmd == "show":
+            print(format_task(load_task(repo, a.task_id)))
+            return 0
+        if not found:
+            print(f"no tasks in {tasks_dir(repo)}", file=sys.stderr)
+            return 0
+        print(format_tasks(found))
+    except (ProjectError, TaskError) as e:
+        print(f"tasks: {e}", file=sys.stderr)
+        return USAGE_ERROR
+    print(f"\n{len(found)} task(s) in {tasks_dir(repo)}", file=sys.stderr)
+    return 0
 
 
 def _map(a: argparse.Namespace) -> int:
@@ -635,6 +734,13 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--allow-git", action="store_true",
                         help="do not deny the git commands a project run denies by default "
                              "(push, checkout, switch, reset --hard, worktree, branch -D)")
+        sp.add_argument("--task-id", metavar="ID", default=None,
+                        help="run the project's tasks/<ID>.md: its body is the task, and its "
+                             "status becomes doing now and done/blocked when the run ends. "
+                             "Mutually exclusive with --task and --task-file.")
+        sp.add_argument("--force", action="store_true",
+                        help="start on a task that is already 'doing' (default: refuse, so two "
+                             "runs cannot claim one task)")
 
     def loop_args(sp) -> None:
         """The knobs of the loop itself. Shared by run and bench."""
@@ -709,6 +815,17 @@ def build_parser() -> argparse.ArgumentParser:
     mt.add_argument("--json", action="store_true",
                     help='print {"stale": [{"package", "reasons"}], "clean": bool}')
     mt.set_defaults(fn=_map)
+
+    ts = sub.add_parser("tasks", help="the tasks a project keeps in tasks/")
+    tsub = ts.add_subparsers(dest="tasks_cmd", required=True)
+    for name, help_text in (("list", "one line per task: id, status, area, branch"),
+                            ("next", "the first task still to do (exit 1 if there is none)"),
+                            ("show", "one task in full: what it is, what finishing means")):
+        tp = tsub.add_parser(name, help=help_text)
+        if name == "show":
+            tp.add_argument("task_id", metavar="ID", help="the task id (the file stem)")
+        tp.add_argument("--project", required=True, metavar="PATH", help="the git repository")
+        tp.set_defaults(fn=_tasks)
 
     w = sub.add_parser("worktree", help="list or prune the worktrees of a project's runs")
     wsub = w.add_subparsers(dest="worktree_cmd", required=True)
