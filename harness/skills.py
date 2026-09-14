@@ -24,6 +24,7 @@ here its errors come back as ``SkillError``, naming the skill file.
 
 Discovery merges every location that exists, lowest precedence first::
 
+    harness/skills_bundled            (--project runs only: orient, map, handoff)
     $XDG_CONFIG_HOME/harness/skills  (else ~/.config/harness/skills)
     $HARNESS_SKILLS                  (os.pathsep-separated)
     <workdir>/.harness/skills        (skills that live with a project)
@@ -33,6 +34,14 @@ A name found twice is a clash: the last directory wins and the clash is
 reported, once, rather than silently deciding. A top-level ``.md`` file with no
 frontmatter is not a skill and is skipped in silence; one that has frontmatter
 but no description is an error, reported the same way.
+
+The bundled skills ship inside the package and are only searched for a
+``--project`` run: they are about working in a mapped repository, and a run
+pointed at a plain directory has no map, no task and no branch. They are the
+lowest precedence there is, so a project that ships its own ``map`` skill wins.
+Wherever a location is named - the header, ``harness skills``, the invocation a
+resume reads back - theirs is the word ``bundled`` rather than wherever pip
+happened to put the package.
 """
 from __future__ import annotations
 
@@ -51,7 +60,33 @@ CONFIG_RELATIVE = Path("harness") / "skills"
 PROJECT_RELATIVE = Path(".harness") / "skills"
 FENCE = frontmatter.FENCE
 
+# The skills that ship with the harness, and what they are called in a record:
+# the word, not the install path, so a trajectory says the same thing on every
+# machine and a resume can find them again.
+BUNDLED = "bundled"
+BUNDLED_DIR = Path(__file__).resolve().parent / "skills_bundled"
+
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def bundled_dir() -> Path:
+    """Where the skills shipped with the harness live."""
+    return BUNDLED_DIR
+
+
+def resolve_dir(raw: Any) -> Path:
+    """A skills directory from a flag or a recording. ``bundled`` is the one
+    name that is not a path: it is wherever this package is installed."""
+    return bundled_dir() if str(raw) == BUNDLED else Path(raw)
+
+
+def label_for(directory: Any) -> str:
+    """What a directory is called in the header, in ``harness skills`` and in
+    the invocation a resume reads back."""
+    try:
+        return BUNDLED if Path(directory).resolve() == bundled_dir() else str(directory)
+    except OSError:                              # a path we cannot resolve is not the bundle
+        return str(directory)
 
 
 class SkillError(Exception):
@@ -195,9 +230,17 @@ class SkillSet:
         """Everything discovery wants to say out loud, once."""
         return list(self.errors) + list(self.clashes)
 
+    def locations(self) -> list[str]:
+        """The directories searched, as they are named in a record."""
+        return [label_for(d) for d in self.dirs]
+
+    def source_of(self, skill: Skill) -> str:
+        """Where one skill came from, as a reader should see it."""
+        return label_for(skill.source)
+
     def describe(self) -> dict:
         """What the trajectory header records about discovery."""
-        return {"dirs": [str(d) for d in self.dirs], "names": self.names()}
+        return {"dirs": self.locations(), "names": self.names()}
 
 
 def _candidates(directory: Path) -> list[tuple[Path, bool]]:
@@ -227,7 +270,7 @@ def discover(dirs: Iterable[Any], workdir: Any = None) -> SkillSet:
     clashes: list[str] = []
     errors: list[str] = []
     for raw in dirs:
-        directory = Path(raw)
+        directory = resolve_dir(raw)
         if not directory.is_dir():
             continue
         searched.append(directory)
@@ -262,15 +305,18 @@ def config_dir(env: Mapping[str, str] | None = None) -> Path:
 
 
 def search_dirs(flags: Iterable[Any] = (), workdir: Any = None,
-                env: Mapping[str, str] | None = None) -> list[Path]:
+                env: Mapping[str, str] | None = None, bundled: bool = False) -> list[Path]:
     """Every skills directory that exists, lowest precedence first.
 
-    config < ``$HARNESS_SKILLS`` < ``<workdir>/.harness/skills`` < ``--skills``:
-    the more specific the location, the later it is searched, and the later a
-    directory is searched the more it wins.
+    bundled < config < ``$HARNESS_SKILLS`` < ``<workdir>/.harness/skills`` <
+    ``--skills``: the more specific the location, the later it is searched, and
+    the later a directory is searched the more it wins. The skills that ship
+    with the harness are the least specific there is, and are searched only
+    when the caller asks (a ``--project`` run does).
     """
     env = os.environ if env is None else env
-    candidates: list[Path] = [config_dir(env)]
+    candidates: list[Path] = [bundled_dir()] if bundled else []
+    candidates.append(config_dir(env))
     for part in (env.get(SKILLS_ENV) or "").split(os.pathsep):
         if part.strip():
             candidates.append(Path(part.strip()).expanduser())

@@ -147,11 +147,15 @@ def test_errors_name_the_line():
         parse_frontmatter("---\nname: [a]\n  stray: 1\n---\n")
 
 
-@pytest.mark.parametrize("path", sorted((REPO_ROOT / "examples" / "skills").glob("*/SKILL.md")),
-                         ids=lambda p: p.parent.name)
+SHIPPED = (sorted((REPO_ROOT / "examples" / "skills").glob("*/SKILL.md"))
+           + sorted((REPO_ROOT / "harness" / "skills_bundled").glob("*/SKILL.md")))
+
+
+@pytest.mark.parametrize("path", SHIPPED, ids=lambda p: p.parent.name)
 def test_shipped_skills_are_in_canonical_form(path):
-    """Every skill the repository ships is what ``dump`` would write, so the
-    writer and the files cannot drift apart unnoticed."""
+    """Every skill the repository ships - the examples and the ones bundled
+    into the package - is what ``dump`` would write, so the writer and the
+    files cannot drift apart unnoticed."""
     text = path.read_text(encoding="utf-8")
     meta, body = parse_frontmatter(text)
     assert dump(meta, body) == text

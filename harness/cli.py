@@ -8,8 +8,9 @@
   harness resume <run_id> [--step-cap N] [--progress-nudge N] [--force]
                  (provider, tools, skills and policy flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
-  harness skills [--skills DIR] [--workdir d] [--filter kw]
+  harness skills [--skills DIR] [--workdir d] [--project PATH] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
+                 [--project PATH [--task-id ID]]
   harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
   harness map    scaffold --project PATH [--package PKG]
   harness map    stale --project PATH [--area PKG] [--json]
@@ -42,7 +43,7 @@ from .plugins import PluginError, load_all
 from .policy import ToolPolicy
 from .project import (ProjectError, ProjectRun, format_worktrees, prune as prune_worktrees,
                       reattach, repo_root, start as start_project, worktrees)
-from .prompts import GLOBAL_ENV, PromptError, resolve_system_prompt
+from .prompts import GLOBAL_ENV, PROJECT_PROMPT_CHARS, PromptError, resolve_system_prompt
 from .registry import ToolRegistry
 from .replay import compare
 from .resume import (prepare as prepare_resume, recorded_invocation, recorded_policy,
@@ -123,7 +124,7 @@ def _invocation(a: argparse.Namespace, workdir: Path, extra: dict,
         "timeout": a.timeout,
         "extra_body": dict(extra),
         "tools": list(a.tools or []),
-        "skills": [str(d) for d in (skills.dirs if skills else [])],
+        "skills": skills.locations() if skills else [],
         "workdir": str(workdir),
     }
     if project is not None:
@@ -132,11 +133,19 @@ def _invocation(a: argparse.Namespace, workdir: Path, extra: dict,
     return out
 
 
-def _system_prompt(a: argparse.Namespace, skills: bool = False) -> tuple[str, list[dict]]:
+def _system_prompt(a: argparse.Namespace, skills: bool = False, project: Any = None,
+                   task: Any = None) -> tuple[str, list[dict]]:
     """The effective system prompt and its provenance, for the prompt flags.
-    Raises PromptError for a file that was named and cannot be read."""
+    Raises PromptError for a file that was named and cannot be read.
+
+    ``project`` and ``task`` add the two layers a project run gets: how this
+    repository is worked on with an excerpt of its map index, and what this
+    task calls finished (see harness.prompts)."""
     return resolve_system_prompt(a.system_prompt, a.append_system_prompt or [],
-                                 use_global=not a.no_global_prompt, skills=skills)
+                                 use_global=not a.no_global_prompt, skills=skills,
+                                 project=project, task=task,
+                                 project_chars=getattr(a, "project_prompt_chars", None)
+                                 or PROJECT_PROMPT_CHARS)
 
 
 def _prompt_flags_given(a: argparse.Namespace) -> list[str]:
@@ -155,7 +164,8 @@ def _registry(a: argparse.Namespace, workdir: Path) -> ToolRegistry:
     return registry
 
 
-def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None) -> SkillSet:
+def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None,
+                     bundled: bool = False) -> SkillSet:
     """What this command line can see. ``recorded`` is the directory list a run
     already searched: with no --skills given, a resume keeps it rather than
     re-resolving an environment that may have moved.
@@ -170,7 +180,7 @@ def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None)
         for named in flags:
             if not Path(named).expanduser().is_dir():
                 print(f"skills: --skills {named}: no such directory", file=sys.stderr)
-        dirs = search_dirs(flags, workdir)
+        dirs = search_dirs(flags, workdir, bundled=bundled)
     found = discover(dirs, workdir)
     for line in found.warnings():
         print(f"skills: {line}", file=sys.stderr)
@@ -178,15 +188,17 @@ def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None)
 
 
 def _build(a: argparse.Namespace, workdir: Path, run_id: str | None,
-           project: ProjectRun | None = None) -> AgentRuntime:
+           project: ProjectRun | None = None, task: Task | None = None) -> AgentRuntime:
     """Everything one run needs, assembled from the command line. Raises
     PluginError, ValueError or PromptError; nothing is created until they pass."""
     registry = _registry(a, workdir)
-    skills = _discover_skills(a, workdir)
+    skills = _discover_skills(a, workdir, bundled=project is not None)
     extra = _extra_body(a.extra_body)
     transport = _transport(a, extra)
     policy = _policy(a, defaults=project.deny_shell_patterns if project else ())
-    system_prompt, prompt_sources = _system_prompt(a, skills=bool(skills))
+    system_prompt, prompt_sources = _system_prompt(a, skills=bool(skills),
+                                                  project=project.repo if project else None,
+                                                  task=task.prompt_meta() if task else None)
     cfg = RuntimeConfig(
         step_cap=a.step_cap,
         require_todos=not a.no_todo_gate,
@@ -277,7 +289,7 @@ def _run(a: argparse.Namespace) -> int:
         workdir.mkdir(parents=True, exist_ok=True)
 
     try:
-        rt = _build(a, workdir, run_id, project)
+        rt = _build(a, workdir, run_id, project, task_file)
     except PluginError as e:
         print(f"run: --tools {e}", file=sys.stderr)
         if project:
@@ -587,26 +599,41 @@ def _tools(a: argparse.Namespace) -> int:
 
 
 def _skills(a: argparse.Namespace) -> int:
-    """What the agent could load, and where each came from."""
-    found = _discover_skills(a, Path(a.workdir).resolve())
+    """What the agent could load, and where each came from.
+
+    ``--project`` lists what a project run would see: that repository's own
+    .harness/skills, and the skills bundled with the harness, which no other
+    kind of run is given.
+    """
+    found = _discover_skills(a, Path(a.project or a.workdir).resolve(), bundled=bool(a.project))
     entries = found.list(a.filter)
     width = max((len(e["name"]) for e in entries), default=0)
     for entry in entries:
         skill = found.get(entry["name"])
         gated = "  [plugin: needs --trust-project-plugins]" if skill.plugin and found.is_project_skill(skill) else ""
-        print(f"{entry['name']:<{width}}  {entry['description']}  ({skill.source}){gated}")
+        print(f"{entry['name']:<{width}}  {entry['description']}  ({found.source_of(skill)}){gated}")
     where = f"{len(found.dirs)} director" + ("y" if len(found.dirs) == 1 else "ies")
     print(f"\n{len(entries)} skill(s) in {where}; "
           "none are in context until the agent calls skill_load", file=sys.stderr)
-    for directory in found.dirs:
-        print(f"  {directory}", file=sys.stderr)
+    for location in found.locations():
+        print(f"  {location}", file=sys.stderr)
     return 0
 
 
 def _prompt(a: argparse.Namespace) -> int:
     """Print the system prompt a run would start with, or where it came from."""
     try:
-        text, sources = _system_prompt(a, skills=bool(_discover_skills(a, None)))
+        project = repo_root(a.project) if a.project else None
+        if a.task_id and project is None:
+            print("prompt: --task-id needs --project", file=sys.stderr)
+            return USAGE_ERROR
+        task = load_task(project, a.task_id) if a.task_id else None
+        skills = _discover_skills(a, None, bundled=project is not None)
+        text, sources = _system_prompt(a, skills=bool(skills), project=project,
+                                       task=task.prompt_meta() if task else None)
+    except (ProjectError, TaskError) as e:
+        print(f"prompt: {e}", file=sys.stderr)
+        return USAGE_ERROR
     except PromptError as e:
         print(f"prompt: {e}", file=sys.stderr)
         return USAGE_ERROR
@@ -741,6 +768,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--force", action="store_true",
                         help="start on a task that is already 'doing' (default: refuse, so two "
                              "runs cannot claim one task)")
+        sp.add_argument("--project-prompt-chars", type=int, default=PROJECT_PROMPT_CHARS,
+                        metavar="N",
+                        help="ceiling for the project layer of the system prompt; excerpt lines "
+                             f"are dropped from the bottom to fit (default: {PROJECT_PROMPT_CHARS})")
 
     def loop_args(sp) -> None:
         """The knobs of the loop itself. Shared by run and bench."""
@@ -797,6 +828,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sk = sub.add_parser("skills", help="list discovered skills (what the agent can load)")
     sk.add_argument("--workdir", default=".", help="project whose .harness/skills is searched")
+    sk.add_argument("--project", metavar="PATH", default=None,
+                    help="list what a --project run on this repository would see, bundled "
+                         "skills included (used as the workdir too)")
     sk.add_argument("--skills", action="append", metavar="DIR", help=skills_help)
     sk.add_argument("--filter", default=None, help="keyword filter, like skill_list")
     sk.set_defaults(fn=_skills)
@@ -847,6 +881,13 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("prompt", help="print the system prompt a run would start with")
     prompt_args(pr)
     pr.add_argument("--skills", action="append", metavar="DIR", help=skills_help)
+    pr.add_argument("--project", metavar="PATH", default=None,
+                    help="show the project layer this repository would add, with the head of "
+                         "its docs/map/INDEX.md")
+    pr.add_argument("--task-id", metavar="ID", default=None,
+                    help="show the task layer tasks/<ID>.md would add (needs --project)")
+    pr.add_argument("--project-prompt-chars", type=int, default=PROJECT_PROMPT_CHARS, metavar="N",
+                    help=f"ceiling for the project layer (default: {PROJECT_PROMPT_CHARS})")
     pr.add_argument("--sources", action="store_true",
                     help="print where each layer of the prompt came from instead of the prompt")
     pr.set_defaults(fn=_prompt)

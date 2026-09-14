@@ -18,5 +18,8 @@ harness = "harness.cli:main"
 [tool.setuptools.packages.find]
 include = ["harness*"]
 
+[tool.setuptools.package-data]
+harness = ["skills_bundled/*/SKILL.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
