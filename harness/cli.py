@@ -49,7 +49,8 @@ from .registry import ToolRegistry
 from .replay import compare
 from .resume import (prepare as prepare_resume, recorded_invocation, recorded_policy,
                      recorded_project)
-from .runtime import RESUMABLE, AgentRuntime, ResumeError, RuntimeConfig, new_run_id
+from .runtime import (RESUMABLE, AgentRuntime, ResumeError, RuntimeConfig,
+                      effective_config, new_run_id)
 from .skills import SkillSet, discover, search_dirs
 from .tasks import (DOING, Task, TaskError, close as close_task, format_task, format_tasks,
                     load as load_task, load_all as load_tasks, next_task, tasks_dir)
@@ -464,7 +465,7 @@ def _resume(a: argparse.Namespace) -> int:
             print(f"resume: {e}", file=sys.stderr)
             return USAGE_ERROR
         workdir = worktree.resolve()
-        hooks = _recorded_hooks(a, project, rec, workdir)
+        hooks = _recorded_hooks(a, project, rec, workdir, records)
         print(f"project {project.get('path')}  branch {project.get('branch')}"
               + ("  (worktree recreated)" if recreated else ""), file=sys.stderr)
     else:
@@ -518,12 +519,15 @@ def _resume(a: argparse.Namespace) -> int:
     return EXIT.get(res.status, 1)
 
 
-def _recorded_hooks(a: argparse.Namespace, block: dict, rec: dict, worktree: Path) -> Any:
+def _recorded_hooks(a: argparse.Namespace, block: dict, rec: dict, worktree: Path,
+                    records: list[dict]) -> Any:
     """The finish hooks a resumed segment runs under: the ones the run was
     started with, from what it recorded, in the worktree it is continuing in.
 
     A segment that is resumed verifies and commits like any other, so a run
-    that took three attempts still ends with its work on the branch.
+    that took three attempts still ends with its work on the branch. Trusting
+    the project's own test command is the recording's answer too, like every
+    other flag a resume defaults - an explicit --trust-project-plugins adds it.
     """
     run = ProjectRun.from_header(block, a.run_id, worktree)
     area: list[str] = []
@@ -534,7 +538,8 @@ def _recorded_hooks(a: argparse.Namespace, block: dict, rec: dict, worktree: Pat
             print(f"resume: {e}", file=sys.stderr)
     return project_hooks(run, test_command=rec.get("test_command"),
                          test_timeout=rec.get("test_timeout") or TEST_TIMEOUT,
-                         trust_project=a.trust_project_plugins,
+                         trust_project=(a.trust_project_plugins
+                                        or effective_config(records).trust_project_plugins),
                          auto_commit=rec.get("auto_commit", True), area=area)
 
 

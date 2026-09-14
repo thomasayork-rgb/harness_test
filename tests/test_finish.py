@@ -362,6 +362,26 @@ def test_a_resumed_segment_verifies_and_commits_too(tmp_path):
     assert log[:2] == ["harness: twice — completed", "harness: twice — step_cap"]
 
 
+def test_a_resume_keeps_the_trust_the_run_was_started_with(tmp_path):
+    """--trust-project-plugins is the recording's answer on resume, like every
+    other flag: the project's own test command was already run once."""
+    repo = mapped_project(tmp_path)
+    runs = tmp_path / "runs"
+    with MockOpenAIServer(edit_script(), model="mock-model", api_key=SECRET) as server:
+        assert run_cli(runs, repo, server, "trusted", "--step-cap", "3",
+                       "--trust-project-plugins") == 3
+
+    rest = [{"content": "Closing.", "tool_calls": [todo("completed")]},
+            {"content": "Reporting.", "tool_calls": [FINISH]}]
+    with MockOpenAIServer(rest, model="mock-model", api_key=SECRET) as server:
+        assert main(["--runs-dir", str(runs), "resume", "trusted", "--endpoint", server.base_url,
+                     "--api-key", SECRET, "--step-cap", "20"]) == 0
+
+    test = last(read_trajectory(runs / "trusted"), "footer")["verify"]["test"]
+    assert test["source"] == ".harness/project.json"
+    assert test["command"] == 'python3 -c "import sys; sys.exit(0)"'
+
+
 def test_the_packaged_cli_commits_what_a_real_process_did(tmp_path):
     repo = mapped_project(tmp_path)
     runs = tmp_path / "runs"
