@@ -18,6 +18,7 @@ Minimal zero-dependency ReAct agent runtime for any OpenAI-compatible chat-compl
 - File tools are rooted to the workdir through `harness/tools/paths.py`: refuse escapes, never clamp. Scratch tools are rooted to the run directory. Error messages show paths relative to the root, never absolute host paths. `run_shell` is rooted but not sandboxed; `--deny-shell-pattern` exists for that.
 - Every tool and every failure path is tested **through the runtime**: a scripted `FakeTransport` run through `toolbelt_add`, the call, and `final_answer`, asserting the JSONL records and artifacts. Anything CLI-facing also gets an end-to-end test over HTTP against a mock server.
 - No network in tests except mock servers you start on localhost. Never probe the environment for credentials or try to reach a live model.
+- A test that needs a git repository builds one with `tests/gitfixture.py`: every git call passes `-c user.name=test -c user.email=test@local`, and `GIT_CONFIG_GLOBAL=/dev/null` / `GIT_CONFIG_NOSYSTEM=1` are in the environment for every test, so the machine's own git configuration can never change what a test sees.
 - Any new option, subcommand or tool is documented in `README.md` in the same terse style, and `python -m harness --help` stays coherent.
 - Checks before every commit:
 
@@ -76,6 +77,7 @@ python -m harness --runs-dir RUNS trace RUN_ID --summary    # status, kinds, per
 python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N] [--force]  # after transport_error, step_cap, stalled, interrupted; --force takes over a live lock
 python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
 python -m harness --runs-dir RUNS bench TASKS.jsonl ...     # a file of tasks, one table, bench.jsonl
+python -m harness --runs-dir RUNS worktree list|prune --project P   # the worktrees of that project's runs
 python -m harness tools [--tools SPEC]                      # what the agent can discover
 python -m harness skills [--skills DIR] [--workdir W]      # what the agent can load
 python -m harness prompt [--sources]                        # the system prompt a run would start with
@@ -120,14 +122,16 @@ harness/
   resume.py        load a run directory and rebuild the runtime around it
   replay.py        ReplayTransport, replay(), compare()
   plugins.py       --tools loading
+  project.py       --project worktrees, dirty rules, git denials, worktree list|prune
   frontmatter.py   the --- block: parse_frontmatter, dump, split_frontmatter
   skills.py        SKILL.md frontmatter, discovery, SkillSet (--skills)
   mockserver.py    MockOpenAIServer, MockAnthropicServer for tests
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
   prompts.py       prompt layers (built-in, global file, appends) and the nudge
-  cli.py           run / resume / bench / skills / tools / prompt / trace / replay
+  cli.py           run / resume / bench / worktree / skills / tools / prompt / trace / replay
   tools/           paths.py (rooting), basic.py, search.py, edit.py, scratch.py
 examples/          global-system.md: an example global prompt
                    skills/: investigate, code-change, final-report
 tests/             one module per area; the *_http and anthropic tests are the only real-HTTP tests
+                   gitfixture.py: fixture repositories for --project (see the rule below)
 ```

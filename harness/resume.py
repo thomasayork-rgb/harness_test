@@ -49,6 +49,13 @@ def recorded_skill_dirs(records: list[dict]) -> list[str]:
     return list(recorded_invocation(records).get("skills") or [])
 
 
+def recorded_project(records: list[dict]) -> dict | None:
+    """The repository, branch and worktree the run works in, or None for a run
+    that was pointed at a plain directory (see harness.project)."""
+    block = setting(records, "project")
+    return block if isinstance(block, dict) and block else None
+
+
 def recorded_policy(records: list[dict]) -> Any:
     """The tool-call policy the last segment ran under, rebuilt, or None."""
     return from_description(setting(records, "policy"))

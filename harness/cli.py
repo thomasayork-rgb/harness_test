@@ -3,12 +3,14 @@
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
                  [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
                  [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
+                 [--project PATH [--allow-dirty] [--no-keep-worktree] [--allow-git]]
   harness resume <run_id> [--step-cap N] [--progress-nudge N] [--force]
                  (provider, tools, skills and policy flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
   harness skills [--skills DIR] [--workdir d] [--filter kw]
   harness prompt [--system-prompt FILE] [--append-system-prompt FILE] [--sources]
   harness bench  TASKS.jsonl --model m --endpoint http://host:port/v1
+  harness worktree list|prune --project PATH [--force]
   harness trace  <run_id> [--step N | --summary]
   harness replay <run_id> [--workdir d] [--tools mod] [--deny-tool NAME]
 
@@ -31,11 +33,14 @@ from typing import Any
 from .anthropic import DEFAULT_MAX_TOKENS, AnthropicMessagesTransport
 from .plugins import PluginError, load_all
 from .policy import ToolPolicy
+from .project import (ProjectError, ProjectRun, format_worktrees, prune as prune_worktrees,
+                      reattach, repo_root, start as start_project, worktrees)
 from .prompts import GLOBAL_ENV, PromptError, resolve_system_prompt
 from .registry import ToolRegistry
 from .replay import compare
-from .resume import prepare as prepare_resume, recorded_invocation, recorded_policy
-from .runtime import AgentRuntime, ResumeError, RuntimeConfig
+from .resume import (prepare as prepare_resume, recorded_invocation, recorded_policy,
+                     recorded_project)
+from .runtime import RESUMABLE, AgentRuntime, ResumeError, RuntimeConfig, new_run_id
 from .skills import SkillSet, discover, search_dirs
 from .tools import register_default_tools, register_scratch_tools
 from .trajectory import format_summary, format_trace, read_trajectory, summarize
@@ -76,25 +81,33 @@ def _transport(a: argparse.Namespace, extra: dict) -> Transport:
     return ChatCompletionsTransport(endpoint=a.endpoint, api_key=key, timeout=a.timeout, extra=extra)
 
 
-def _policy(a: argparse.Namespace, recorded: Any = None) -> ToolPolicy | None:
+def _policy(a: argparse.Namespace, recorded: Any = None,
+            defaults: Any = ()) -> ToolPolicy | None:
     """--deny-tool / --deny-shell-pattern as a policy, or None. Raises ValueError
     on a pattern that is not a regex.
 
     ``recorded`` is the policy a run already ran under: with no flags given, a
     resume or a replay keeps it rather than quietly dropping the denials.
+    ``defaults`` are patterns the run itself asks for - a project run denies the
+    git that reaches outside its worktree - and they merge with the flags rather
+    than replacing them.
     """
-    if a.deny_tool or a.deny_shell_pattern:
-        policy = ToolPolicy(deny_tools=a.deny_tool or [], deny_shell_patterns=a.deny_shell_pattern or [])
+    patterns = list(a.deny_shell_pattern or []) + list(defaults or ())
+    if a.deny_tool or patterns:
+        policy = ToolPolicy(deny_tools=a.deny_tool or [], deny_shell_patterns=patterns)
         return policy or None
     return recorded
 
 
 def _invocation(a: argparse.Namespace, workdir: Path, extra: dict,
-                skills: SkillSet | None = None) -> dict:
+                skills: SkillSet | None = None, project: ProjectRun | None = None) -> dict:
     """What a resume needs to reach the same provider with the same tools and
     the same skills. Deliberately never the API key: it would end up in the run
-    directory."""
-    return {
+    directory.
+
+    For a project run ``workdir`` is the worktree, and the project it was cut
+    from is recorded beside it."""
+    out = {
         "endpoint": a.endpoint,
         "provider": a.provider,
         "max_tokens": a.max_tokens,
@@ -104,6 +117,10 @@ def _invocation(a: argparse.Namespace, workdir: Path, extra: dict,
         "skills": [str(d) for d in (skills.dirs if skills else [])],
         "workdir": str(workdir),
     }
+    if project is not None:
+        out["project"] = str(project.repo)
+        out["task_id"] = project.task_id
+    return out
 
 
 def _system_prompt(a: argparse.Namespace, skills: bool = False) -> tuple[str, list[dict]]:
@@ -151,14 +168,15 @@ def _discover_skills(a: argparse.Namespace, workdir: Path, recorded: Any = None)
     return found
 
 
-def _build(a: argparse.Namespace, workdir: Path, run_id: str | None) -> AgentRuntime:
+def _build(a: argparse.Namespace, workdir: Path, run_id: str | None,
+           project: ProjectRun | None = None) -> AgentRuntime:
     """Everything one run needs, assembled from the command line. Raises
     PluginError, ValueError or PromptError; nothing is created until they pass."""
     registry = _registry(a, workdir)
     skills = _discover_skills(a, workdir)
     extra = _extra_body(a.extra_body)
     transport = _transport(a, extra)
-    policy = _policy(a)
+    policy = _policy(a, defaults=project.deny_shell_patterns if project else ())
     system_prompt, prompt_sources = _system_prompt(a, skills=bool(skills))
     cfg = RuntimeConfig(
         step_cap=a.step_cap,
@@ -172,7 +190,8 @@ def _build(a: argparse.Namespace, workdir: Path, run_id: str | None) -> AgentRun
     )
     rt = AgentRuntime(registry, transport, Path(a.runs_dir), a.model, cfg, system_prompt=system_prompt,
                       run_id=run_id, policy=policy, prompt_sources=prompt_sources,
-                      invocation=_invocation(a, workdir, extra, skills), skills=skills)
+                      invocation=_invocation(a, workdir, extra, skills, project), skills=skills,
+                      project=project.header() if project else None)
     # the scratch pad lives in the run directory, so it can only be rooted now
     register_scratch_tools(registry, rt.run_dir)
     return rt
@@ -186,19 +205,49 @@ def _run(a: argparse.Namespace) -> int:
     else:
         print("run: need --task or --task-file", file=sys.stderr)
         return USAGE_ERROR
-    workdir = Path(a.workdir).resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
+    if a.project and a.workdir:
+        print("run: --project and --workdir are mutually exclusive: a project run works in a "
+              "worktree the harness cuts for it", file=sys.stderr)
+        return USAGE_ERROR
+
+    project: ProjectRun | None = None
+    run_id = a.run_id
+    if a.project:
+        # the worktree is the workdir, so it has to exist before anything is built
+        run_id = run_id or new_run_id()
+        try:
+            project = start_project(a.project, Path(a.runs_dir), run_id,
+                                    allow_dirty=a.allow_dirty, allow_git=a.allow_git)
+        except ProjectError as e:
+            print(f"run: {e}", file=sys.stderr)
+            return USAGE_ERROR
+        workdir = project.worktree
+        print(f"project {project.repo}  branch {project.branch}  at {project.base_sha[:12]}",
+              file=sys.stderr)
+    else:
+        workdir = Path(a.workdir or ".").resolve()
+        workdir.mkdir(parents=True, exist_ok=True)
+
     try:
-        rt = _build(a, workdir, a.run_id)
+        rt = _build(a, workdir, run_id, project)
     except PluginError as e:
         print(f"run: --tools {e}", file=sys.stderr)
+        if project:
+            project.abandon()
         return USAGE_ERROR
     except (ValueError, PromptError) as e:
         print(f"run: {e}", file=sys.stderr)
+        if project:
+            project.abandon()
         return USAGE_ERROR
     print(f"run {rt.run_id}  ->  {rt.run_dir}", file=sys.stderr)
     res = rt.run(task)
     print(f"status: {res.status}  steps: {res.steps}", file=sys.stderr)
+    if project and not a.keep_worktree and res.status not in RESUMABLE:
+        try:
+            print(project.release(), file=sys.stderr)
+        except ProjectError as e:
+            print(f"run: {e}", file=sys.stderr)
     if res.final:
         print(res.final.get("content", ""))
     return EXIT.get(res.status, 1)
@@ -311,7 +360,21 @@ def _resume(a: argparse.Namespace) -> int:
     a.timeout = a.timeout if a.timeout is not None else (rec.get("timeout") or DEFAULT_TIMEOUT)
     a.tools = a.tools or list(rec.get("tools") or [])
     workdir = Path(a.workdir or rec.get("workdir") or ".").resolve()
-    workdir.mkdir(parents=True, exist_ok=True)
+    # a project run continues in its own worktree; if it was pruned it is cut
+    # again from the branch, and the model is told what that cost (harness.project)
+    project = recorded_project(records)
+    recreated: str | None = None
+    if project and not a.workdir:
+        try:
+            worktree, recreated = reattach(project)
+        except ProjectError as e:
+            print(f"resume: {e}", file=sys.stderr)
+            return USAGE_ERROR
+        workdir = worktree.resolve()
+        print(f"project {project.get('path')}  branch {project.get('branch')}"
+              + ("  (worktree recreated)" if recreated else ""), file=sys.stderr)
+    else:
+        workdir.mkdir(parents=True, exist_ok=True)
     try:
         registry = _registry(a, workdir)
     except PluginError as e:
@@ -330,15 +393,21 @@ def _resume(a: argparse.Namespace) -> int:
           + (f"  tools {', '.join(a.tools)}" if a.tools else "")
           + (f"  skills {len(skills)}" if skills else ""), file=sys.stderr)
     try:
+        invocation = _invocation(a, workdir, extra, skills)
+        for key in ("project", "task_id"):       # carried forward, like every other field
+            if key in rec:
+                invocation[key] = rec[key]
         rt, detail = prepare_resume(run_dir, registry, transport, model=a.model,
                                     step_cap=a.step_cap, policy=policy,
-                                    invocation=_invocation(a, workdir, extra, skills),
+                                    invocation=invocation,
                                     skills=skills, progress_nudge_steps=a.progress_nudge,
                                     trust_project_plugins=a.trust_project_plugins or None,
                                     force=a.force)
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
+        if recreated:
+            detail = f"{detail}; {recreated}" if detail else recreated
         res = rt.resume(detail)
     except FileNotFoundError as e:
         print(str(e), file=sys.stderr)
@@ -350,6 +419,23 @@ def _resume(a: argparse.Namespace) -> int:
     if res.final:
         print(res.final.get("content", ""))
     return EXIT.get(res.status, 1)
+
+
+def _worktree(a: argparse.Namespace) -> int:
+    """List or prune the worktrees this runs directory holds for a project."""
+    try:
+        repo = repo_root(a.project)
+        found = worktrees(repo, Path(a.runs_dir))
+        if a.worktree_cmd == "prune":
+            lines = prune_worktrees(repo, Path(a.runs_dir), force=a.force)
+            print("\n".join(lines) if lines else "no worktrees under " + str(Path(a.runs_dir)))
+            return 0
+        print(format_worktrees(found))
+    except ProjectError as e:
+        print(f"worktree: {e}", file=sys.stderr)
+        return USAGE_ERROR
+    print(f"\n{len(found)} worktree(s) of {repo} under {Path(a.runs_dir)}", file=sys.stderr)
+    return 0
 
 
 def _tools(a: argparse.Namespace) -> int:
@@ -501,6 +587,22 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--deny-shell-pattern", action="append", metavar="REGEX",
                         help="refuse run_shell commands matching this regex. Repeatable.")
 
+    def project_args(sp) -> None:
+        """A run that works in a git worktree of a project. See harness.project."""
+        sp.add_argument("--project", metavar="PATH", default=None,
+                        help="git repository to work on: the run gets a worktree of it at "
+                             "<runs-dir>/<run_id>/wt on branch task/<run_id>, and that is its "
+                             "workdir. Mutually exclusive with --workdir.")
+        sp.add_argument("--allow-dirty", action="store_true",
+                        help="start even though the project has uncommitted changes; the "
+                             "worktree is still cut from HEAD, so the agent will not see them")
+        sp.add_argument("--keep-worktree", action=argparse.BooleanOptionalAction, default=True,
+                        help="keep the worktree after the run (default). --no-keep-worktree "
+                             "removes a clean one when the run is finished; the branch stays.")
+        sp.add_argument("--allow-git", action="store_true",
+                        help="do not deny the git commands a project run denies by default "
+                             "(push, checkout, switch, reset --hard, worktree, branch -D)")
+
     def loop_args(sp) -> None:
         """The knobs of the loop itself. Shared by run and bench."""
         sp.add_argument("--step-cap", type=int, default=250)
@@ -521,8 +623,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--task")
     r.add_argument("--task-file")
     model_args(r, model_required=True)
+    r.set_defaults(workdir=None)     # so --project can tell "not given" from the default
     r.add_argument("--run-id", default=None)
     loop_args(r)
+    project_args(r)
     prompt_args(r)
     r.set_defaults(fn=_run)
 
@@ -557,6 +661,17 @@ def build_parser() -> argparse.ArgumentParser:
     sk.add_argument("--skills", action="append", metavar="DIR", help=skills_help)
     sk.add_argument("--filter", default=None, help="keyword filter, like skill_list")
     sk.set_defaults(fn=_skills)
+
+    w = sub.add_parser("worktree", help="list or prune the worktrees of a project's runs")
+    wsub = w.add_subparsers(dest="worktree_cmd", required=True)
+    for name, help_text in (("list", "one line per worktree: run, status, branch, dirty, path"),
+                            ("prune", "remove the worktrees of finished runs, keeping the branches")):
+        wp = wsub.add_parser(name, help=help_text)
+        wp.add_argument("--project", required=True, metavar="PATH", help="the git repository")
+        if name == "prune":
+            wp.add_argument("--force", action="store_true",
+                            help="remove a worktree with uncommitted changes too")
+        wp.set_defaults(fn=_worktree)
 
     l = sub.add_parser("tools", help="list registered tools (what the agent can discover)")
     l.add_argument("--workdir", default=".", help="root the fs_* tools would be given")

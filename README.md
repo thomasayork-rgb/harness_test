@@ -20,8 +20,11 @@ python -m harness run \
   --endpoint http://localhost:8080/v1 \
   --workdir ./project
 
+python -m harness run --project ./repo --task "..." --model m --endpoint http://localhost:8080/v1
 python -m harness resume <run_id> --step-cap 400        # same flags as before, from the recording
 python -m harness bench tasks.jsonl --model m --endpoint http://localhost:8080/v1
+python -m harness worktree list --project ./repo        # the worktrees this runs dir holds
+python -m harness worktree prune --project ./repo       # remove the ones of finished runs
 python -m harness tools                       # what the agent can discover
 python -m harness skills                      # what the agent can load
 python -m harness prompt [--sources]          # the system prompt a run would start with
@@ -35,6 +38,8 @@ python -m harness replay <run_id> --workdir ./project   # re-run a recording aga
 
 Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--skills ./skills` (repeatable), `--skill-chars 12000`, `--progress-nudge 12`, `--trust-project-plugins`, `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
 
+`--project PATH` points a run at a git repository instead of a directory: it gets a worktree of its own at `<runs-dir>/<run_id>/wt`, cut from HEAD on branch `task/<run_id>`, and that worktree is the workdir (so `--project` and `--workdir` are mutually exclusive). The project must be committed first — the worktree is cut from HEAD, so uncommitted work is invisible to the agent, and uncommitted `docs/map/` most of all; changes under `tasks/` are ignored and `--allow-dirty` overrides the check. A project run also denies the git that reaches past its worktree (`git push`, `checkout`, `switch`, `reset --hard`, `worktree`, `branch -D`) as ordinary policy denials, which `--allow-git` lifts. `--no-keep-worktree` removes the worktree after a finished run, keeping the branch; a worktree with uncommitted changes is left alone. The header records a `project` block (`path`, `base_sha`, `branch`, `worktree`, `task_id`), so `resume` continues in the same worktree — or, if it is gone, cuts it again from the branch and tells the model that whatever was uncommitted in it is gone.
+
 ## Run directory
 
 ```
@@ -43,10 +48,11 @@ runs/<run_id>/
   state.json           persisted RunState (active tools, loaded skills, todos, messages, final)
   artifacts/           step_0007_final_answer.txt — full result per step
   scratch/             notes the agent wrote with scratch_write
+  wt/                  the worktree of a --project run: its workdir, on branch task/<run_id>
   run.lock             the pid of the process in the loop; removed when it leaves
 ```
 
-Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step, notes included. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, `skills` (the directories searched and the names found), and `invocation`: the endpoint, provider, workdir, `--tools` modules, skill directories and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
+Step record fields: `step, ts, elapsed_ms, reasoning, tool, args, kind, call_index, result_preview, result_bytes, artifact, tokens_in, tokens_out, todo_snapshot`. `call_index` is the position of the call within its model turn, so turn boundaries survive the round trip (see Replay). `kind` ∈ `ok | error | denied | final_accepted | final_rejected | text_only`. When one turn issues several tool calls, usage is recorded on the first and `null` on the rest — never double-counted. `todo_snapshot` is the state after the step, notes included. The header records the `config` the run started under, the `policy` in force or `null`, the `prompt_sources` the system message was built from, `skills` (the directories searched and the names found), `project` (the repository, base commit, branch and worktree of a `--project` run, or `null`), and `invocation`: the endpoint, provider, workdir, `--tools` modules, skill directories and request options the run was launched with, which is what `resume` defaults to. The API key is never recorded.
 
 Two other record types sit in the same file. A `note` record — `{"type": "note", "step", "kind", "text"}` — is something the loop said to the model that is not a step: the progress nudge (`kind: "progress_nudge"`) and the budget warning (`kind: "budget"`, once per crossing, when protected results alone exceed `--context-chars`). It does not count toward the step cap; `format_trace` prints it at the seam and `trace --summary` counts it. The footer carries `todos`: the todo list as it stood when the run ended, with its notes, whether or not there was a final answer.
 
@@ -400,11 +406,12 @@ harness/
   replay.py        ReplayTransport, replay, compare
   mockserver.py    MockOpenAIServer, MockAnthropicServer (scripted, stdlib http.server)
   plugins.py       --tools module loading
+  project.py       --project: worktrees, the dirty rules, the git denials, worktree list|prune
   frontmatter.py   the --- block: parse, dump, split (shared by skills and the project files)
   skills.py        SKILL.md frontmatter, discovery, SkillSet
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
   prompts.py       the prompt layers: built-in, global file, appends
-  cli.py           run / resume / bench / skills / tools / prompt / trace / replay
+  cli.py           run / resume / bench / worktree / skills / tools / prompt / trace / replay
   tools/basic.py   fs_list, fs_read, fs_write, run_shell (rooted to --workdir)
   tools/search.py  fs_search, fs_glob
   tools/edit.py    fs_edit

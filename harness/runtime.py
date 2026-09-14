@@ -144,6 +144,12 @@ INTERRUPTED = "KeyboardInterrupt at step {step}"
 LOCK_FILE = "run.lock"
 
 
+def new_run_id() -> str:
+    """A run id: sortable by time, unique enough for one machine. The CLI needs
+    one before the runtime exists when a run has a worktree to cut first."""
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+
+
 def read_lock(run_dir: Path) -> int | None:
     """The pid that claims this run directory, or None if no lock is readable."""
     try:
@@ -301,6 +307,7 @@ class AgentRuntime:
         prompt_sources: list[dict] | None = None,
         invocation: dict | None = None,
         skills: SkillSet | None = None,
+        project: dict | None = None,
     ) -> None:
         self.registry = registry
         self.transport = transport
@@ -313,13 +320,16 @@ class AgentRuntime:
         # how this run was launched: endpoint, provider, workdir, tool modules.
         # Recorded so `resume` can default to it; never holds the API key.
         self.invocation = dict(invocation or {})
+        # the repository, branch and worktree this run works in, or None for a
+        # run pointed at a plain directory (see harness.project)
+        self.project = dict(project) if project else None
         # where that prompt came from, for the header (see harness.prompts)
         self.prompt_sources = prompt_sources or [
             {"source": BUILTIN if system_prompt is None else PROVIDED,
              "role": "base", "chars": len(self.system_prompt)}]
         # policy(name, args) -> denial message or None; see harness.policy
         self.policy = policy or None
-        self.run_id = run_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        self.run_id = run_id or new_run_id()
         self.run_dir = Path(runs_dir) / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.run_dir / "state.json"
@@ -610,7 +620,8 @@ class AgentRuntime:
                                config=asdict(cfg), policy=self._policy_description(),
                                prompt_sources=list(self.prompt_sources),
                                invocation=dict(self.invocation),
-                               skills=self.skills.describe())
+                               skills=self.skills.describe(),
+                               project=dict(self.project) if self.project else None)
             st.save(self.state_path)
             return self._loop()
         finally:

@@ -22,7 +22,9 @@ One JSONL file per run. Record types:
 The header (and each resume record) also carries ``policy`` - what the
 tool-call policy in force denied, or null - and ``invocation``: how the segment
 was launched (endpoint, provider, workdir, tool modules, request options), so a
-resume can default to it. Never the API key.
+resume can default to it. Never the API key. The header also carries
+``project``: the repository, base commit, branch and worktree of a
+``--project`` run, or null (see harness.project).
   resume  - a seam between two segments of the same run: what the previous
             segment ended with, and the model and config the next one starts
             with (see harness.resume)
@@ -70,7 +72,8 @@ class TrajectoryWriter:
 
     def header(self, *, run_id: str, model: str, step_cap: int, task: str, config: dict,
                policy: Any = None, prompt_sources: list[dict] | None = None,
-               invocation: dict | None = None, skills: dict | None = None) -> None:
+               invocation: dict | None = None, skills: dict | None = None,
+               project: dict | None = None) -> None:
         self._write({
             "type": "header",
             "run_id": run_id,
@@ -84,6 +87,7 @@ class TrajectoryWriter:
             "prompt_sources": prompt_sources or [],
             "invocation": invocation or {},
             "skills": skills or {"dirs": [], "names": []},
+            "project": project,
         })
 
     def write_artifact(self, step: int, tool: str | None, text: str) -> str:
@@ -191,6 +195,16 @@ def _epoch(ts: str | None) -> float | None:
         return None
 
 
+def format_project(block: dict | None) -> str:
+    """One line naming the repository, branch and worktree a run worked in."""
+    if not block:
+        return ""
+    task = f"  task {block['task_id']}" if block.get("task_id") else ""
+    return (f"project: {block.get('path')}  branch {block.get('branch')}  from "
+            f"{str(block.get('base_sha') or '')[:12]}{task}\n         worktree "
+            f"{block.get('worktree')}")
+
+
 def format_prompt_sources(sources: list[dict] | None) -> str:
     """One line naming every layer the system prompt was built from."""
     if not sources:
@@ -281,6 +295,7 @@ def summarize(records: list[dict]) -> dict:
         "step_cap": (resumes[-1] if resumes else header).get("step_cap"),
         "policy": (resumes[-1] if resumes else header).get("policy"),
         "prompt_sources": header.get("prompt_sources") or [],
+        "project": header.get("project") or None,
         "skills_available": (header.get("skills") or {}).get("names") or [],
         "skill_dirs": (header.get("skills") or {}).get("dirs") or [],
         "skills_loaded": skills_loaded(records),
@@ -317,6 +332,8 @@ def format_summary(records: list[dict]) -> str:
     if s["segments"] > 1:
         lines.append(f"segments: {s['segments']}  resumed from: {', '.join(s['resumed_from'])}")
     lines.append(f"status: {s['status']}  steps: {s['steps']}" + (f"  ({s['detail']})" if s["detail"] else ""))
+    if s["project"]:
+        lines.append(format_project(s["project"]))
     wall = "?" if s["wall_s"] is None else f"{s['wall_s']:g}"
     lines.append(f"elapsed: {s['elapsed_ms'] / 1000:.1f} s in steps, {wall} s wall")
     lines.append(f"tokens: {s['tokens_in']} in / {s['tokens_out']} out")
@@ -406,6 +423,8 @@ def format_trace(records: list[dict], run_dir: Path, step: int | None = None) ->
         if kind == "header":
             lines.append(f"run {rec['run_id']}  model={rec['model']}  cap={rec['step_cap']}  {rec['ts']}")
             lines.append(f"task: {rec['task'][:200]}")
+            if rec.get("project"):
+                lines.append(format_project(rec["project"]))
             lines.append("prompt: " + format_prompt_sources(rec.get("prompt_sources")))
             lines.append("")
         elif kind == "step":
