@@ -77,6 +77,7 @@ python -m harness --runs-dir RUNS trace RUN_ID --summary    # status, kinds, per
 python -m harness --runs-dir RUNS resume RUN_ID [--step-cap N] [--force]  # after transport_error, step_cap, stalled, interrupted; --force takes over a live lock
 python -m harness --runs-dir RUNS replay RUN_ID             # exit 0 identical, 1 drift
 python -m harness --runs-dir RUNS bench TASKS.jsonl ...     # a file of tasks, one table, bench.jsonl
+python -m harness map scaffold --project P [--package PKG]  # write or refresh docs/map/
 python -m harness --runs-dir RUNS worktree list|prune --project P   # the worktrees of that project's runs
 python -m harness tools [--tools SPEC]                      # what the agent can discover
 python -m harness skills [--skills DIR] [--workdir W]      # what the agent can load
@@ -123,12 +124,13 @@ harness/
   replay.py        ReplayTransport, replay(), compare()
   plugins.py       --tools loading
   project.py       --project worktrees, dirty rules, git denials, worktree list|prune
+  codemap.py       docs/map/ scaffolding: packages, imports, public names, INDEX.md
   frontmatter.py   the --- block: parse_frontmatter, dump, split_frontmatter
   skills.py        SKILL.md frontmatter, discovery, SkillSet (--skills)
   mockserver.py    MockOpenAIServer, MockAnthropicServer for tests
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
   prompts.py       prompt layers (built-in, global file, appends) and the nudge
-  cli.py           run / resume / bench / worktree / skills / tools / prompt / trace / replay
+  cli.py           run / resume / bench / map / worktree / skills / tools / prompt / trace / replay
   tools/           paths.py (rooting), basic.py, search.py, edit.py, scratch.py
 examples/          global-system.md: an example global prompt
                    skills/: investigate, code-change, final-report

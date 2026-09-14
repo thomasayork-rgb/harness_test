@@ -23,6 +23,7 @@ python -m harness run \
 python -m harness run --project ./repo --task "..." --model m --endpoint http://localhost:8080/v1
 python -m harness resume <run_id> --step-cap 400        # same flags as before, from the recording
 python -m harness bench tasks.jsonl --model m --endpoint http://localhost:8080/v1
+python -m harness map scaffold --project ./repo         # write or refresh docs/map/
 python -m harness worktree list --project ./repo        # the worktrees this runs dir holds
 python -m harness worktree prune --project ./repo       # remove the ones of finished runs
 python -m harness tools                       # what the agent can discover
@@ -38,7 +39,7 @@ python -m harness replay <run_id> --workdir ./project   # re-run a recording aga
 
 Options: `--step-cap 250`, `--result-chars 2000`, `--context-chars 60000`, `--preview-chars 400`, `--no-todo-gate`, `--timeout 120`, `--tools mypkg.tools` (repeatable), `--skills ./skills` (repeatable), `--skill-chars 12000`, `--progress-nudge 12`, `--trust-project-plugins`, `--extra-body '{"temperature": 0}'` (merged into every request; may not set `model`, `messages`, `tools`, `tool_choice`), `--provider openai|anthropic`, `--max-tokens 4096` (anthropic only), `--deny-tool NAME` and `--deny-shell-pattern REGEX` (both repeatable), `--system-prompt FILE`, `--append-system-prompt FILE` (repeatable) and `--no-global-prompt` (see System prompt).
 
-`--project PATH` points a run at a git repository instead of a directory: it gets a worktree of its own at `<runs-dir>/<run_id>/wt`, cut from HEAD on branch `task/<run_id>`, and that worktree is the workdir (so `--project` and `--workdir` are mutually exclusive). The project must be committed first — the worktree is cut from HEAD, so uncommitted work is invisible to the agent, and uncommitted `docs/map/` most of all; changes under `tasks/` are ignored and `--allow-dirty` overrides the check. A project run also denies the git that reaches past its worktree (`git push`, `checkout`, `switch`, `reset --hard`, `worktree`, `branch -D`) as ordinary policy denials, which `--allow-git` lifts. `--no-keep-worktree` removes the worktree after a finished run, keeping the branch; a worktree with uncommitted changes is left alone. The header records a `project` block (`path`, `base_sha`, `branch`, `worktree`, `task_id`), so `resume` continues in the same worktree — or, if it is gone, cuts it again from the branch and tells the model that whatever was uncommitted in it is gone.
+`--project PATH` points a run at a git repository instead of a directory: it gets a worktree of its own at `<runs-dir>/<run_id>/wt`, cut from HEAD on branch `task/<run_id>`, and that worktree is the workdir (so `--project` and `--workdir` are mutually exclusive). The project must be committed first — the worktree is cut from HEAD, so uncommitted work is invisible to the agent, and uncommitted `docs/map/` most of all; changes under `tasks/` are ignored and `--allow-dirty` overrides the check. A project run also denies the git that reaches past its worktree (`git push`, `checkout`, `switch`, `reset --hard`, `worktree`, `branch -D`) as ordinary policy denials, which `--allow-git` lifts. `harness map scaffold --project PATH [--package PKG]` writes the project's code map: `docs/map/<dotted.package>.md` per package — generated frontmatter (files, loc, imports, public names, who imports it, and the git blob sha each of those was read from) above prose a reader writes, which a refresh keeps byte for byte — plus `docs/map/INDEX.md`, one line per package with the first line of its Purpose. It is deterministic: same tree, same bytes, no timestamps. `--no-keep-worktree` removes the worktree after a finished run, keeping the branch; a worktree with uncommitted changes is left alone. The header records a `project` block (`path`, `base_sha`, `branch`, `worktree`, `task_id`), so `resume` continues in the same worktree — or, if it is gone, cuts it again from the branch and tells the model that whatever was uncommitted in it is gone.
 
 ## Run directory
 
@@ -407,11 +408,12 @@ harness/
   mockserver.py    MockOpenAIServer, MockAnthropicServer (scripted, stdlib http.server)
   plugins.py       --tools module loading
   project.py       --project: worktrees, the dirty rules, the git denials, worktree list|prune
+  codemap.py       docs/map/: the scan, the generated frontmatter, INDEX.md
   frontmatter.py   the --- block: parse, dump, split (shared by skills and the project files)
   skills.py        SKILL.md frontmatter, discovery, SkillSet
   trajectory.py    TrajectoryWriter, read_trajectory, format_trace, summarize
   prompts.py       the prompt layers: built-in, global file, appends
-  cli.py           run / resume / bench / worktree / skills / tools / prompt / trace / replay
+  cli.py           run / resume / bench / map / worktree / skills / tools / prompt / trace / replay
   tools/basic.py   fs_list, fs_read, fs_write, run_shell (rooted to --workdir)
   tools/search.py  fs_search, fs_glob
   tools/edit.py    fs_edit
