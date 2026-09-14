@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -18,6 +19,27 @@ ENV_PREFIX = "HARNESS_"
 def child_env() -> dict:
     """The environment a shell command runs with: this process's, minus HARNESS_*."""
     return {k: v for k, v in os.environ.items() if not k.startswith(ENV_PREFIX)}
+
+
+# How long to wait for a killed process group to go away before giving up on
+# reaping it. Nothing survives SIGKILL, so this is only a floor on how long a
+# timeout can take.
+REAP_TIMEOUT = 5.0
+
+
+def kill_group(proc: subprocess.Popen) -> None:
+    """Kill the whole group the command was started in.
+
+    ``start_new_session=True`` makes the shell a session and process-group
+    leader, so everything it started - a backgrounded ``sleep``, a server, a
+    build - is in that group and dies with it. Killing the shell alone leaves
+    those children running with the pipes still open, which is what a timeout
+    used to do.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()      # the group is gone, or was never ours to signal
 
 
 def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
@@ -87,10 +109,23 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
         # A non-zero exit is a result: the command ran and said no. A timeout is
         # a tool failure, so it raises and lands in the trajectory as kind
         # "error" rather than hiding inside an "ok" result.
+        proc = subprocess.Popen(command, shell=True, cwd=root, text=True, env=child_env(),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
         try:
-            proc = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True,
-                                  timeout=timeout, env=child_env())
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # everything the command started goes with it, not just the shell
+            kill_group(proc)
+            try:
+                proc.communicate(timeout=REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:   # pragma: no cover - nothing survives SIGKILL
+                pass
             raise TimeoutError(f"command timed out after {timeout}s: {command}") from None
+        except KeyboardInterrupt:
+            # a new session means Ctrl-C at the terminal never reached the
+            # command; the run is ending, so take its group with it
+            kill_group(proc)
+            raise
         return {"command": command, "exit_code": proc.returncode,
-                "stdout": proc.stdout[-20000:], "stderr": proc.stderr[-5000:]}
+                "stdout": out[-20000:], "stderr": err[-5000:]}

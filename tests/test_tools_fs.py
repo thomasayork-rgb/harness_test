@@ -1,5 +1,8 @@
 """The new file tools, exercised through the runtime rather than called directly."""
 import json
+import os
+import time
+from pathlib import Path
 
 from harness.registry import ToolRegistry
 from harness.runtime import AgentRuntime, RuntimeConfig
@@ -231,6 +234,53 @@ def test_write_and_list_through_the_runtime(tmp_path):
     assert "IsADirectoryError" in steps[9]["result_preview"]
     assert "missing required argument(s): content" in steps[10]["result_preview"]
     assert [e["name"] for e in json.loads(artifact(res, steps[11]))["entries"]] == ["report.txt"]
+
+
+def process_state(pid: int) -> str:
+    """``R``/``S``/``Z`` for a pid, or ``gone`` when there is no such process.
+
+    Read from /proc, which is Linux; anywhere without it every pid reads as
+    ``gone``, which makes the check that uses this weaker, never wrong.
+    """
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8").splitlines():
+            if line.startswith("State:"):
+                return line.split()[1]
+    except OSError:
+        return "gone"
+    return "?"
+
+
+def wait_until_dead(pid: int, seconds: float = 3.0) -> str:
+    """Poll for a process to die. A zombie is dead: it is waiting to be reaped."""
+    deadline = time.monotonic() + seconds
+    state = process_state(pid)
+    while state not in ("gone", "Z") and time.monotonic() < deadline:
+        time.sleep(0.05)
+        state = process_state(pid)
+    return state
+
+
+def test_a_timed_out_command_takes_what_it_started_with_it(tmp_path):
+    """The shell was killed and its children were not, so a backgrounded
+    process outlived the tool, the run, and the harness."""
+    work = project(tmp_path / "work")
+    script = [
+        {"content": "Activating the shell.", "tool_calls": [call("toolbelt_add", {"names": ["run_shell"]})]},
+        {"content": "Backgrounding something that outlives the command.",
+         "tool_calls": [call("run_shell", {"command": "sleep 30 & echo $! > sleep.pid; wait", "timeout": 1})]},
+        {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
+    ]
+    res, steps = drive(tmp_path, work, script)
+    assert res.status == "completed"
+    assert steps[1]["kind"] == "error"
+    assert steps[1]["result_preview"].startswith("error: TimeoutError: command timed out after 1s")
+
+    pid = int((work / "sleep.pid").read_text(encoding="utf-8").strip())
+    state = wait_until_dead(pid)
+    if state not in ("gone", "Z"):
+        os.kill(pid, 9)                                  # do not leave it behind either way
+        raise AssertionError(f"the grandchild {pid} was still {state} after the timeout")
 
 
 def test_run_shell_hands_no_harness_variable_to_the_command(tmp_path, monkeypatch):
