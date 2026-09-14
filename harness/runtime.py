@@ -15,6 +15,10 @@ Failure semantics (all deliberate, all visible in the trajectory):
                                 N consecutive → status "stalled"
   transport error             → retry once, then status "transport_error"
   step cap                    → status "step_cap", final null
+  KeyboardInterrupt           → status "interrupted", footer written, the calls
+                                of the turn in flight answered "not executed";
+                                the run can be resumed like any other
+                                interruption
   policy denies a call        → the denial as the tool result, kind "denied";
                                 loop continues (see harness.policy)
   plan stops moving           → after progress_nudge_steps steps with no change
@@ -33,6 +37,7 @@ The loop is the same loop; only the way the conversation starts differs.
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -116,8 +121,42 @@ SKILL_META_TOOLS: list[dict] = [
 SKILL_META_NAMES = {t["function"]["name"] for t in SKILL_META_TOOLS}
 
 # Statuses a run can be picked up from. completed/blocked/failed are answers,
-# not interruptions, and "running" means some other process still owns the run.
-RESUMABLE = ("transport_error", "step_cap", "stalled")
+# not interruptions. "running" is not here because it means a process may still
+# own the run - whether one does is the lock file's question (see the resume
+# module), not this tuple's.
+RESUMABLE = ("transport_error", "step_cap", "stalled", "interrupted")
+
+# Ctrl-C is an interruption like the endpoint falling over: the run stops where
+# it stands, says so in the footer, and can be picked up again.
+INTERRUPTED = "KeyboardInterrupt at step {step}"
+
+# One process owns a run directory at a time, and says so in a pid file for as
+# long as run()/resume() is inside the loop. It is advisory and it is not
+# proof: a hard kill leaves the file behind with nobody running, which is why
+# resume asks whether the pid is still alive rather than trusting the file.
+LOCK_FILE = "run.lock"
+
+
+def read_lock(run_dir: Path) -> int | None:
+    """The pid that claims this run directory, or None if no lock is readable."""
+    try:
+        return int((Path(run_dir) / LOCK_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_alive(pid: int) -> bool:
+    """Whether that process is still there. A PermissionError means it is: it
+    exists and belongs to someone else."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 RESUME_NOTE = ("This run was interrupted ({status}: {detail}) and has been resumed. "
                "The conversation above is yours; continue from it. Step {step} of {cap}.")
@@ -286,6 +325,9 @@ class AgentRuntime:
         # plugin modules skill_load has already registered in this process, so
         # reloading a skill after unloading it does not collide with itself
         self._skill_plugins: set[str] = set()
+        # calls of the turn in flight that have not run yet: what an interrupt
+        # has to answer for so the transcript stays well formed
+        self._pending: list[dict] = []
 
     # ---- request assembly -------------------------------------------------
 
@@ -511,6 +553,7 @@ class AgentRuntime:
         """Answer the calls of a turn that was cut short, so the transcript stays well formed."""
         reason = {
             "step_cap": "the step cap was reached before this call ran",
+            "interrupted": "the run was interrupted before this call finished",
         }.get(status, "the run ended before this call ran")
         for c in calls:
             self.state.messages.append({
@@ -522,6 +565,17 @@ class AgentRuntime:
 
     # ---- the loop ---------------------------------------------------------
 
+    def _lock(self) -> None:
+        """Claim the run directory for this process, for as long as the loop runs."""
+        (self.run_dir / LOCK_FILE).write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    def _unlock(self) -> None:
+        """Release it. A lock still there afterwards was left by a hard kill."""
+        try:
+            (self.run_dir / LOCK_FILE).unlink()
+        except OSError:
+            pass
+
     def run(self, task: str) -> RunResult:
         """Start a fresh run: header, opening conversation, then the loop."""
         cfg = self.config
@@ -530,13 +584,17 @@ class AgentRuntime:
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": task},
         ]
-        self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task,
-                           config=asdict(cfg), policy=self._policy_description(),
-                           prompt_sources=list(self.prompt_sources),
-                           invocation=dict(self.invocation),
-                           skills=self.skills.describe())
-        st.save(self.state_path)
-        return self._loop()
+        self._lock()
+        try:
+            self.writer.header(run_id=self.run_id, model=self.model, step_cap=cfg.step_cap, task=task,
+                               config=asdict(cfg), policy=self._policy_description(),
+                               prompt_sources=list(self.prompt_sources),
+                               invocation=dict(self.invocation),
+                               skills=self.skills.describe())
+            st.save(self.state_path)
+            return self._loop()
+        finally:
+            self._unlock()
 
     def resume(self, detail: str | None = None) -> RunResult:
         """Continue an interrupted run from its persisted state.
@@ -562,16 +620,42 @@ class AgentRuntime:
                 "raise it with --step-cap to resume")
         note = RESUME_NOTE.format(status=st.status, detail=detail or "no detail",
                                   step=st.step, cap=cfg.step_cap)
-        self.writer.resume(run_id=self.run_id, model=self.model, from_status=st.status,
-                           from_step=st.step, from_detail=detail, step_cap=cfg.step_cap,
-                           config=asdict(cfg), note=note, policy=self._policy_description(),
-                           invocation=dict(self.invocation))
-        st.messages.append({"role": "user", "content": note})
-        st.status = "running"
-        st.save(self.state_path)
-        return self._loop()
+        self._lock()
+        try:
+            self.writer.resume(run_id=self.run_id, model=self.model, from_status=st.status,
+                               from_step=st.step, from_detail=detail, step_cap=cfg.step_cap,
+                               config=asdict(cfg), note=note, policy=self._policy_description(),
+                               invocation=dict(self.invocation))
+            st.messages.append({"role": "user", "content": note})
+            st.status = "running"
+            st.save(self.state_path)
+            return self._loop()
+        finally:
+            self._unlock()
 
     def _loop(self) -> RunResult:
+        st = self.state
+        try:
+            status, detail = self._turns()
+        except KeyboardInterrupt:
+            # Ctrl-C can land anywhere: waiting on the endpoint, inside a tool.
+            # Whatever the turn in flight still had queued is answered, so the
+            # transcript this leaves behind is one a provider would accept.
+            status, detail = "interrupted", INTERRUPTED.format(step=st.step)
+            self._close_unexecuted(self._pending, status)
+
+        st.status = status
+        st.save(self.state_path)
+        self.writer.footer(run_id=self.run_id, status=status, steps=st.step, final=st.final,
+                           detail=detail, todos=list(st.todos))
+        return RunResult(run_id=self.run_id, status=status, steps=st.step, final=st.final, run_dir=self.run_dir)
+
+    def _turns(self) -> tuple[str, str | None]:
+        """The loop proper: turn after turn until something ends the run.
+
+        Split out so ``_loop`` can catch a KeyboardInterrupt around the whole of
+        it and still write the footer exactly once.
+        """
         cfg = self.config
         st = self.state
         text_only = 0
@@ -627,15 +711,18 @@ class AgentRuntime:
             })
 
             executed = 0
+            self._pending = list(calls)     # what an interrupt would have to answer for
             for index, c in enumerate(calls):
                 first = index == 0
                 if st.step >= cfg.step_cap:
                     status, detail = "step_cap", f"step cap {cfg.step_cap} reached"
                     break
-                st.step += 1
                 t1 = time.monotonic()
                 self._annotate = {}
                 result, kind = self._dispatch(c["name"], c["arguments"])
+                # the number is claimed once the call has run: an interrupt
+                # inside a tool must not leave a gap in the step count
+                st.step += 1
                 dispatch_ms = int((time.monotonic() - t1) * 1000)
                 art = self.writer.write_artifact(st.step, c["name"], result)
                 self.writer.step(run_id=self.run_id, step=st.step, elapsed_ms=(elapsed if first else 0) + dispatch_ms,
@@ -657,13 +744,15 @@ class AgentRuntime:
                 message.update(extra)
                 st.messages.append(message)
                 executed += 1
+                self._pending = calls[executed:]
                 moved = signature(st.todos)
                 plan, idle = (moved, 0) if moved != plan else (plan, idle + 1)
                 if kind == "final_accepted":
                     status = st.final["status"]  # type: ignore[index]
                     break
 
-            self._close_unexecuted(calls[executed:], status)
+            self._close_unexecuted(self._pending, status)
+            self._pending = []
             self.budget.supersede(st.messages)
             self.budget.enforce(st.messages)
             if status == "running":
@@ -671,8 +760,4 @@ class AgentRuntime:
                 idle = self._nudge_progress(idle)
             st.save(self.state_path)
 
-        st.status = status
-        st.save(self.state_path)
-        self.writer.footer(run_id=self.run_id, status=status, steps=st.step, final=st.final,
-                           detail=detail, todos=list(st.todos))
-        return RunResult(run_id=self.run_id, status=status, steps=st.step, final=st.final, run_dir=self.run_dir)
+        return status, detail

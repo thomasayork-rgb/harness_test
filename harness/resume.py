@@ -15,8 +15,14 @@ that state and calling ``resume()`` instead of ``run()``::
 The run keeps its id, its directory, and its trajectory: the new segment is
 appended after a ``resume`` record and the step counter carries on. Statuses
 that are answers rather than interruptions (``completed``, ``blocked``,
-``failed``) are refused, as is a run some other process still has open
-(``running``).
+``failed``) are refused.
+
+A run whose state still says ``running`` was never closed: either a process
+still owns it, or one died without writing a footer. The lock file says which.
+While the pid in it is alive the run is refused - two processes appending to
+one trajectory is not a thing to guess at - and ``force=True`` is how an
+operator who knows better says so. A lock nobody holds is stale, so the run is
+picked up as an interruption like any other.
 """
 from __future__ import annotations
 
@@ -25,8 +31,8 @@ from typing import Any
 
 from .policy import from_description
 from .registry import ToolRegistry
-from .runtime import (RESUMABLE, AgentRuntime, ResumeError, RunResult, RunState,
-                      effective_config)
+from .runtime import (LOCK_FILE, RESUMABLE, AgentRuntime, ResumeError, RunResult, RunState,
+                      effective_config, pid_alive, read_lock)
 from .trajectory import last, read_trajectory, setting
 from .transport import Transport
 
@@ -62,6 +68,29 @@ def load(run_dir: Any) -> tuple[RunState, list[dict]]:
         raise ResumeError(f"{state_path}: cannot read run state: {e}") from None
 
 
+def claim(run_dir: Path, state: RunState, force: bool) -> str | None:
+    """Settle a run whose state still says ``running``, and say what happened.
+
+    Returns the detail for the resume note, or None if the run was closed
+    properly and its footer already says. Raises ResumeError while another
+    process is demonstrably still on it.
+    """
+    if state.status != "running":
+        return None
+    holder = read_lock(run_dir)
+    if holder is not None and pid_alive(holder):
+        if not force:
+            raise ResumeError(
+                f"run {state.run_id} is still running: process {holder} holds "
+                f"{LOCK_FILE} in {run_dir}. Wait for it to finish, or pass --force "
+                "if you know that process is gone.")
+        state.status = "interrupted"
+        return f"resumed with --force while pid {holder} still held {LOCK_FILE}"
+    state.status = "interrupted"
+    return (f"the process that held this run (pid {holder}) is gone" if holder is not None
+            else "the run stopped without writing a footer, and nothing holds its lock")
+
+
 def prepare(
     run_dir: Any,
     registry: ToolRegistry,
@@ -74,6 +103,7 @@ def prepare(
     skills: Any = None,
     progress_nudge_steps: int | None = None,
     trust_project_plugins: bool | None = None,
+    force: bool = False,
 ) -> tuple[AgentRuntime, str | None]:
     """Rebuild the runtime for a resumable run. Returns it with the detail of
     the footer that closed the previous segment, for ``AgentRuntime.resume``.
@@ -81,9 +111,11 @@ def prepare(
     ``invocation`` is what the new segment runs under, recorded at the seam for
     the next resume; it defaults to what the recording already says. ``skills``
     is the skill set the next segment can load from - a run that could load
-    skills before must still be able to after."""
+    skills before must still be able to after. ``force`` takes over a run whose
+    lock is still held (see ``claim``)."""
     path = Path(run_dir)
     state, records = load(path)
+    detail = claim(path, state, force)
     if state.status not in RESUMABLE:
         raise ResumeError(
             f"run {state.run_id} ended with status '{state.status}'; only "
@@ -99,7 +131,9 @@ def prepare(
                            run_id=path.name, state=state, policy=policy,
                            invocation=invocation or recorded_invocation(records),
                            skills=skills)
-    return runtime, last(records, "footer").get("detail")
+    # a run that was never closed has no footer of its own; any footer in the
+    # file belongs to an earlier segment and would misname what stopped this one
+    return runtime, detail if detail is not None else last(records, "footer").get("detail")
 
 
 def resume(
@@ -114,10 +148,11 @@ def resume(
     skills: Any = None,
     progress_nudge_steps: int | None = None,
     trust_project_plugins: bool | None = None,
+    force: bool = False,
 ) -> RunResult:
     """Continue a run in place. The trajectory grows; it is not replaced."""
     runtime, detail = prepare(run_dir, registry, transport, model=model, step_cap=step_cap,
                               policy=policy, invocation=invocation, skills=skills,
                               progress_nudge_steps=progress_nudge_steps,
-                              trust_project_plugins=trust_project_plugins)
+                              trust_project_plugins=trust_project_plugins, force=force)
     return runtime.resume(detail)

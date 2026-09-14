@@ -101,7 +101,11 @@ class ChatCompletionsTransport:
 
 class FakeTransport:
     """Scripted responses for tests. Each entry is either a normalized response
-    dict or an Exception instance to raise. Records every request it receives."""
+    dict or an exception instance to raise. Records every request it receives.
+
+    Any BaseException is raised, not only an Exception: ``KeyboardInterrupt()``
+    in a script is how a test puts Ctrl-C in the middle of a run.
+    """
 
     def __init__(self, script: list[Any]) -> None:
         self.script = list(script)
@@ -112,7 +116,7 @@ class FakeTransport:
         if not self.script:
             raise TransportError("fake transport script exhausted")
         item = self.script.pop(0)
-        if isinstance(item, Exception):
+        if isinstance(item, BaseException):
             raise item
         return {"content": item.get("content", ""), "tool_calls": item.get("tool_calls", []), "usage": item.get("usage")}
 

@@ -1,8 +1,10 @@
 """Resuming an interrupted run: same run id, same directory, one trajectory."""
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -165,6 +167,149 @@ def test_resume_after_a_stall(tmp_path):
     assert "stalled" in msgs[-1]["content"]
 
 
+def interrupting_registry():
+    """echo, plus a tool that behaves like Ctrl-C landing inside a long call."""
+    r = registry()
+    r.register(ToolSpec("slow", "Take a while.", {"type": "object", "properties": {}, "required": []},
+                        _interrupt))
+    return r
+
+
+def _interrupt():
+    raise KeyboardInterrupt()
+
+
+def test_ctrl_c_inside_a_tool_ends_the_run_as_interrupted(tmp_path):
+    """Ctrl-C used to leave status "running", no footer, and a run resume then
+    refused: the work was on disk and unreachable."""
+    script = [
+        {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["echo", "slow"]}, id="a")]},
+        {"content": "Planning.", "tool_calls": [todo("in_progress")]},
+        {"content": "Three at once; the second one hangs.",
+         "tool_calls": [call("echo", {"s": "one"}, id="e1"), call("slow", {}, id="slow1"),
+                        call("echo", {"s": "three"}, id="e3")]},
+    ]
+    rt = AgentRuntime(interrupting_registry(), FakeTransport(script), tmp_path / "runs",
+                      "fake-model", RuntimeConfig(step_cap=20), run_id="ctrlc")
+    first = rt.run("echo some things")
+    assert first.status == "interrupted" and first.steps == 3      # the call that never ran is not one
+
+    recs = read_trajectory(first.run_dir)
+    assert [r["type"] for r in recs] == ["header", "step", "step", "step", "footer"]
+    assert [r["step"] for r in recs if r["type"] == "step"] == [1, 2, 3]
+    footer = recs[-1]
+    assert footer["status"] == "interrupted" and footer["steps"] == 3
+    assert footer["detail"] == "KeyboardInterrupt at step 3"
+    assert footer["todos"] == [{"id": "1", "content": "echo things", "status": "in_progress"}]
+    state = json.loads((first.run_dir / "state.json").read_text())
+    assert state["status"] == "interrupted"
+    assert not (first.run_dir / "run.lock").exists()               # released on the way out
+
+    rest = FakeTransport([
+        {"content": "Back. Closing.", "tool_calls": [todo("completed")]},
+        {"content": "Finishing.", "tool_calls": [FINISH]},
+    ])
+    res = resume(first.run_dir, interrupting_registry(), rest)
+    assert res.status == "completed" and res.steps == 5
+
+    opening = rest.requests[0]["messages"]
+    assert "interrupted" in opening[-1]["content"] and "KeyboardInterrupt at step 3" in opening[-1]["content"]
+    requested = [tc["id"] for m in opening if m.get("tool_calls") for tc in m["tool_calls"]]
+    answered = [m["tool_call_id"] for m in opening if m["role"] == "tool"]
+    assert requested == ["a", "todo_in_progress", "e1", "slow1", "e3"] == answered
+    assert "interrupted before this call finished" in opening[-3]["content"]
+    seam = next(r for r in read_trajectory(res.run_dir) if r["type"] == "resume")
+    assert seam["from_status"] == "interrupted" and seam["from_step"] == 3
+
+
+def test_ctrl_c_between_turns_is_the_same_interruption(tmp_path):
+    rt = AgentRuntime(registry(), FakeTransport([
+        {"content": "Planning.", "tool_calls": [todo("in_progress")]},
+        KeyboardInterrupt(),                       # while waiting on the endpoint
+    ]), tmp_path / "runs", "fake-model", run_id="waiting")
+    first = rt.run("echo some things")
+    assert first.status == "interrupted" and first.steps == 1
+    assert read_trajectory(first.run_dir)[-1]["detail"] == "KeyboardInterrupt at step 1"
+
+    res = resume(first.run_dir, registry(), FakeTransport([
+        {"content": "Closing.", "tool_calls": [todo("completed"), FINISH]}]))
+    assert res.status == "completed" and res.steps == 3
+
+
+def dead_pid() -> int:
+    """A pid nothing is using: a process that has exited and been reaped."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait(timeout=60)
+    return proc.pid
+
+
+def half_dead_run(tmp_path, run_id, lock: int | None):
+    """A run whose state still says "running", as a hard kill would leave it."""
+    first = capped_run(tmp_path, run_id=run_id)
+    state = json.loads((first.run_dir / "state.json").read_text())
+    state["status"] = "running"
+    (first.run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    if lock is not None:
+        (first.run_dir / "run.lock").write_text(f"{lock}\n", encoding="utf-8")
+    return first
+
+
+def finishing():
+    return FakeTransport([{"content": "Closing.", "tool_calls": [todo("completed")]},
+                          {"content": "Finishing.", "tool_calls": [FINISH]}])
+
+
+def test_a_stale_lock_is_not_a_running_run(tmp_path):
+    """A process killed outright leaves "running" behind with nobody running.
+    The pid in the lock is what settles it, not the word in state.json."""
+    stale = half_dead_run(tmp_path, "stale", lock=dead_pid())
+    rt, detail = prepare(stale.run_dir, registry(), finishing(), step_cap=10)
+    assert rt.state.status == "interrupted" and "is gone" in detail
+    assert rt.resume(detail).status == "completed"
+    seam = next(r for r in read_trajectory(stale.run_dir) if r["type"] == "resume")
+    assert seam["from_status"] == "interrupted" and "is gone" in seam["from_detail"]
+
+    # and a run from before there were locks at all reads the same way
+    none = half_dead_run(tmp_path, "nolock", lock=None)
+    res = resume(none.run_dir, registry(), finishing(), step_cap=10)
+    assert res.status == "completed"
+    assert "nothing holds its lock" in next(
+        r for r in read_trajectory(none.run_dir) if r["type"] == "resume")["from_detail"]
+
+
+def test_a_live_lock_is_refused_until_it_is_forced(tmp_path):
+    live = half_dead_run(tmp_path, "live", lock=os.getpid())
+    with pytest.raises(ResumeError, match=f"still running: process {os.getpid()} holds run.lock"):
+        resume(live.run_dir, registry(), FakeTransport([]), step_cap=10)
+    recs = read_trajectory(live.run_dir)
+    assert not any(r["type"] == "resume" for r in recs)      # nothing was appended
+    assert json.loads((live.run_dir / "state.json").read_text())["status"] == "running"
+
+    res = resume(live.run_dir, registry(), finishing(), step_cap=10, force=True)
+    assert res.status == "completed"
+    seam = next(r for r in read_trajectory(live.run_dir) if r["type"] == "resume")
+    assert f"--force while pid {os.getpid()} still held" in seam["from_detail"]
+
+
+def test_the_lock_is_held_for_the_length_of_the_run(tmp_path):
+    """Seen from inside a tool: the run directory says who owns it."""
+    seen = {}
+    r = registry()
+    r.register(ToolSpec("peek", "Read the lock.", {"type": "object", "properties": {}, "required": []},
+                        lambda: seen.setdefault("lock", (run_dir / "run.lock").read_text().strip())))
+    fake = FakeTransport([
+        {"content": "Activating.", "tool_calls": [call("toolbelt_add", {"names": ["peek"]})]},
+        {"content": "Peeking.", "tool_calls": [call("peek", {})]},
+        {"content": "Done.", "tool_calls": [todo("completed"), FINISH]},
+    ])
+    rt = AgentRuntime(r, fake, tmp_path / "runs", "fake-model", run_id="locked")
+    run_dir = rt.run_dir
+    res = rt.run("peek at the lock")
+    assert res.status == "completed"
+    assert seen["lock"] == str(os.getpid())
+    assert not (run_dir / "run.lock").exists()
+
+
 def test_finished_runs_are_not_resumable(tmp_path):
     script = [{"content": "Done.", "tool_calls": [todo("completed"), FINISH]}]
     done = AgentRuntime(registry(), FakeTransport(script), tmp_path / "runs", "fake-model",
@@ -280,6 +425,92 @@ def test_resume_cli_over_http(tmp_path, capsys):
     assert rc == 64 and "ended with status 'completed'" in capsys.readouterr().err
     rc = main(["--runs-dir", str(runs), "resume", "nope", "--endpoint", "http://127.0.0.1:1/v1"])
     assert rc == 66 and "no trajectory at" in capsys.readouterr().err
+
+
+def slow_response(seconds: float, payload: dict):
+    """A mock-server entry that keeps the request open, so a test can Ctrl-C it."""
+    def answer(_body):
+        time.sleep(seconds)
+        return payload
+    return answer
+
+
+def test_ctrl_c_on_the_command_line_is_exit_130_and_resumable(tmp_path):
+    """A real SIGINT to a real `harness run`, mid-request."""
+    runs = tmp_path / "runs"
+    script = [
+        {"content": "Planning.", "tool_calls": [call("todo_write", {"todos": [
+            {"id": "find", "content": "find the port", "status": "in_progress"}]})]},
+        slow_response(30, {}),                      # still waiting when the signal lands
+    ]
+    with MockOpenAIServer(script, model="mock-model") as server:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "harness", "--runs-dir", str(runs), "run", "--task", "find the port",
+             "--model", "mock-model", "--endpoint", server.base_url, "--workdir", str(tmp_path),
+             "--run-id", "sigint"],
+            cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+        deadline = time.monotonic() + 60
+        while server.served < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert server.served == 2, "the run never reached the slow request"
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=60)
+
+    assert proc.returncode == 130, err
+    assert "status: interrupted  steps: 1" in err
+    recs = read_trajectory(runs / "sigint")
+    assert [r["type"] for r in recs] == ["header", "step", "footer"]
+    assert recs[-1]["status"] == "interrupted" and recs[-1]["todos"][0]["id"] == "find"
+    assert not (runs / "sigint" / "run.lock").exists()
+
+    rest = [{"content": "Back. Closing.", "tool_calls": [call("todo_write", {"todos": [
+                {"id": "find", "content": "find the port", "status": "completed"}]})]},
+            {"content": "Finishing.", "tool_calls": [call("final_answer", {
+                "status": "completed", "content": "The port is 8080."})]}]
+    with MockOpenAIServer(rest, model="mock-model") as server:
+        rc = main(["--runs-dir", str(runs), "resume", "sigint", "--endpoint", server.base_url])
+    assert rc == 0
+    assert summarize(read_trajectory(runs / "sigint"))["resumed_from"] == ["interrupted"]
+
+
+def test_the_cli_refuses_a_live_lock_and_takes_it_over_with_force(tmp_path, capsys):
+    runs, work = tmp_path / "runs", tmp_path / "project"
+    work.mkdir()
+    first = [{"content": "Planning.", "tool_calls": [call("todo_write", {"todos": [
+        {"id": "a", "content": "do it", "status": "in_progress"}]})]}]
+    with MockOpenAIServer(first, model="mock-model") as server:
+        assert main(["--runs-dir", str(runs), "run", "--task", "t", "--model", "mock-model",
+                     "--endpoint", server.base_url, "--workdir", str(work),
+                     "--run-id", "held", "--step-cap", "1"]) == 3
+
+    # as a process that is still working on it would leave the directory
+    state = json.loads((runs / "held" / "state.json").read_text())
+    state["status"] = "running"
+    (runs / "held" / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (runs / "held" / "run.lock").write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    rest = [{"content": "Closing.", "tool_calls": [call("todo_write", {"todos": [
+                {"id": "a", "content": "do it", "status": "completed"}]})]},
+            {"content": "Finishing.", "tool_calls": [call("final_answer", {
+                "status": "completed", "content": "done"})]}]
+    with MockOpenAIServer(rest, model="mock-model") as server:
+        rc = main(["--runs-dir", str(runs), "resume", "held", "--endpoint", server.base_url,
+                   "--step-cap", "9"])
+        err = capsys.readouterr().err
+        assert rc == 64 and f"still running: process {os.getpid()} holds run.lock" in err
+        assert "--force" in err and server.served == 0        # nothing was sent anywhere
+
+        proc = subprocess.run(
+            [sys.executable, "-m", "harness", "--runs-dir", str(runs), "resume", "held",
+             "--endpoint", server.base_url, "--step-cap", "9", "--force"],
+            cwd=str(tmp_path), capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+    assert proc.returncode == 0, proc.stderr
+    assert "resume held at step 1 after interrupted" in proc.stderr
+    seam = next(r for r in read_trajectory(runs / "held") if r["type"] == "resume")
+    assert f"--force while pid {os.getpid()}" in seam["from_detail"]
+    assert not (runs / "held" / "run.lock").exists()
 
 
 def test_resume_keeps_going_when_the_endpoint_is_still_down(tmp_path):

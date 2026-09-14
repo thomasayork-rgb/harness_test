@@ -3,7 +3,7 @@
   harness run    --task "..." | --task-file f  --model m  --endpoint http://host:port/v1
                  [--provider openai|anthropic] [--deny-tool NAME] [--deny-shell-pattern RE]
                  [--system-prompt FILE] [--append-system-prompt FILE] [--no-global-prompt]
-  harness resume <run_id> [--step-cap N] [--progress-nudge N]
+  harness resume <run_id> [--step-cap N] [--progress-nudge N] [--force]
                  (provider, tools, skills and policy flags default to the recording)
   harness tools  [--tools mod] [--filter kw]
   harness skills [--skills DIR] [--workdir d] [--filter kw]
@@ -13,7 +13,7 @@
   harness replay <run_id> [--workdir d] [--tools mod] [--deny-tool NAME]
 
 Exit codes for run and resume: 0 completed, 1 blocked/failed, 2
-transport_error, 3 step_cap, 4 stalled. For replay: 0 identical to the
+transport_error, 3 step_cap, 4 stalled, 130 interrupted. For replay: 0 identical to the
 recording, 1 drifted. For bench: 0 if every task completed, 1 otherwise. A
 bad command line (no task, unloadable --tools, an unreadable prompt file, a
 run that cannot be resumed) is 64; an unreadable run directory is 66.
@@ -42,7 +42,8 @@ from .trajectory import format_summary, format_trace, read_trajectory, summarize
 from .replay import replay as replay_run
 from .transport import ChatCompletionsTransport, Transport
 
-EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3, "stalled": 4}
+EXIT = {"completed": 0, "blocked": 1, "failed": 1, "transport_error": 2, "step_cap": 3,
+        "stalled": 4, "interrupted": 130}
 USAGE_ERROR = 64
 DEFAULT_TIMEOUT = 120.0
 # Fields the harness owns; --extra-body may not set them.
@@ -333,7 +334,8 @@ def _resume(a: argparse.Namespace) -> int:
                                     step_cap=a.step_cap, policy=policy,
                                     invocation=_invocation(a, workdir, extra, skills),
                                     skills=skills, progress_nudge_steps=a.progress_nudge,
-                                    trust_project_plugins=a.trust_project_plugins or None)
+                                    trust_project_plugins=a.trust_project_plugins or None,
+                                    force=a.force)
         register_scratch_tools(registry, rt.run_dir)   # same pad, same run directory
         print(f"resume {rt.run_id} at step {rt.state.step} after {rt.state.status}  ->  {rt.run_dir}",
               file=sys.stderr)
@@ -543,6 +545,9 @@ def build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--trust-project-plugins", action="store_true",
                     help="let a skill from <workdir>/.harness/skills register its plugin for the "
                          "rest of the run (default: what the run recorded)")
+    rs.add_argument("--force", action="store_true",
+                    help="take over a run whose lock is still held by a live process "
+                         "(default: refuse, so two processes cannot append to one trajectory)")
     prompt_args(rs)      # accepted so the refusal can explain itself, never applied
     rs.set_defaults(fn=_resume)
 
