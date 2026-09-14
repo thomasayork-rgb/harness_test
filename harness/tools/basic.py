@@ -1,11 +1,23 @@
 """Basic tools, all rooted to a working directory. Path escapes are refused."""
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
 from ..registry import ToolRegistry
 from .paths import make_resolver
+
+# Everything the harness configures itself with lives under this prefix, and
+# HARNESS_API_KEY is one of them. A shell command inherits the environment, so
+# `env` - or anything that dumps it - would put the operator's key in a result,
+# an artifact and the trajectory. The child gets the environment without them.
+ENV_PREFIX = "HARNESS_"
+
+
+def child_env() -> dict:
+    """The environment a shell command runs with: this process's, minus HARNESS_*."""
+    return {k: v for k, v in os.environ.items() if not k.startswith(ENV_PREFIX)}
 
 
 def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
@@ -66,7 +78,8 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
 
     @registry.tool(
         "run_shell",
-        "Run a shell command in the workdir. Returns stdout, stderr, exit code. Timeout in seconds.",
+        "Run a shell command in the workdir. Returns stdout, stderr, exit code. Timeout in seconds.\n"
+        "The command inherits this process's environment without its HARNESS_* variables.",
         {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}},
          "required": ["command"]},
     )
@@ -75,7 +88,8 @@ def register_basic_tools(registry: ToolRegistry, workdir: Path) -> None:
         # a tool failure, so it raises and lands in the trajectory as kind
         # "error" rather than hiding inside an "ok" result.
         try:
-            proc = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True, timeout=timeout)
+            proc = subprocess.run(command, shell=True, cwd=root, capture_output=True, text=True,
+                                  timeout=timeout, env=child_env())
         except subprocess.TimeoutExpired:
             raise TimeoutError(f"command timed out after {timeout}s: {command}") from None
         return {"command": command, "exit_code": proc.returncode,

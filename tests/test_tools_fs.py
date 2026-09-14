@@ -233,6 +233,36 @@ def test_write_and_list_through_the_runtime(tmp_path):
     assert [e["name"] for e in json.loads(artifact(res, steps[11]))["entries"]] == ["report.txt"]
 
 
+def test_run_shell_hands_no_harness_variable_to_the_command(tmp_path, monkeypatch):
+    """`env` in a shell command used to put HARNESS_API_KEY in a result, an
+    artifact and the trajectory, where anyone reading the run can see it."""
+    monkeypatch.setenv("HARNESS_API_KEY", "sk-not-for-the-model")
+    monkeypatch.setenv("HARNESS_SKILLS", "/somewhere/skills")
+    monkeypatch.setenv("KEPT_BY_THE_CHILD", "yes")
+    work = project(tmp_path / "work")
+    script = [
+        {"content": "Activating the shell.", "tool_calls": [call("toolbelt_add", {"names": ["run_shell"]})]},
+        {"content": "What is in my environment?", "tool_calls": [call("run_shell", {"command": "env"})]},
+        {"content": "And by name.",
+         "tool_calls": [call("run_shell", {"command": "echo \"[$HARNESS_API_KEY]\""})]},
+        {"content": "Wrapping up.", "tool_calls": [TODO_DONE, FINISH]},
+    ]
+    res, steps = drive(tmp_path, work, script)
+    assert res.status == "completed"
+
+    env = json.loads(artifact(res, steps[1]))
+    assert env["exit_code"] == 0
+    assert [line for line in env["stdout"].splitlines() if line.startswith("HARNESS_")] == []
+    assert "KEPT_BY_THE_CHILD=yes" in env["stdout"].splitlines()      # only HARNESS_* is taken
+    assert json.loads(artifact(res, steps[2]))["stdout"] == "[]\n"    # unset, not empty-by-accident
+
+    blob = (res.run_dir / "trajectory.jsonl").read_text(encoding="utf-8")
+    blob += "".join(p.read_text(encoding="utf-8") for p in (res.run_dir / "artifacts").iterdir())
+    assert "sk-not-for-the-model" not in blob            # not in the run, anywhere
+    assert "HARNESS_API_KEY=" not in blob                # the only HARNESS_ text is what the model typed
+    assert "HARNESS_SKILLS" not in blob
+
+
 def test_run_shell_through_the_runtime(tmp_path):
     work = project(tmp_path / "work")
     (work.parent / "outside.txt").write_text("secret\n", encoding="utf-8")
